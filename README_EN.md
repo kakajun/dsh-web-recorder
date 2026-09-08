@@ -8,7 +8,7 @@ A browser-operation recorder plugin for DSH. It targets the scenario where a hum
 
 To have an agent talk to a business platform (e.g., an EIP-style system) directly through its APIs, you first need to answer three questions: which endpoints the platform exposes, which endpoint each business step maps to, and what the request / response shapes look like. The traditional approach is to read API docs or reverse-engineer the frontend code — but docs are often missing or outdated, and even with an endpoint list in hand, it is hard to line up “what the user does on the page” with “which API calls fire underneath”.
 
-This plugin takes a different angle: **no reverse engineering — just keep the operation evidence**. As a developer, you walk the target business flow manually in a headed browser window, and that is it — no more digging through docs afterwards, because the raw data left behind by this one session already answers all three questions:
+This plugin takes a different angle: **no reverse engineering — just keep the operation evidence**. As a developer, you first arm the recorder (`recorder_start`), then let the target business flow run completely inside a monitored headed browser window — driven either by a human manually, or step by step by a browser-automation tool such as playwright MCP / browser-use — and that is it: no more digging through docs afterwards, because the raw data left behind by this one session already answers all three questions:
 
 - **UI event timeline**: when each click / input / form submission happened, which element it hit, and what value was entered;
 - **Network event timeline**: which `xhr` / `fetch` requests each step triggered — method, URL, request headers, request body, response body, and failure reasons.
@@ -42,6 +42,52 @@ Reading the two side by side: a single “enter keyword and query” action show
 | `recorder_status()`    | Reports status: whether recording is active, per-type event counts, output directory, and the result of the last wrap-up |
 
 If the user closes the browser window directly, the session is finalized automatically (`reason: browser-closed`) and the recorded data is kept.
+
+## Usage: how this plugin gets invoked
+
+### When it is picked up (trigger scenarios)
+
+Once the plugin is enabled, its three tools show up in the DSH session's tool list; “hitting” the plugin happens when the model chooses a tool, based on the tool names and descriptions. When the user's task is about “figuring out which APIs a web business flow calls under the hood, what the parameters / responses look like, and producing an API-level flow description or skill from that”, the model should proactively call `recorder_*`. Typical task phrasings:
+
+- “Figure out the API calls and their order behind the ‘xxx’ flow on platform XX, and turn it into a skill so I can do it purely via APIs from now on”
+- “What request does the ‘Query’ button on page XX send? How are the parameters passed?”
+- “I'll walk through the flow on the page; you record it, then analyze it and produce an API-integration guide”
+
+If the question can be answered without real page interaction (e.g., it is already answered in docs), the plugin usually won't be picked up.
+
+### How the tools become available (loading)
+
+This repository is itself a DSH plugin: the entry is `lib/index.js` (source `src/index.ts`); `package.json`'s `dsh.bundle.patch` points to the `cordis.patch.yml` at the repo root, which merges the plugin into the host profile (its `id` / `name` are both `dsh-web-recorder`); the official `@deepseek-ai/*` packages are provided by the host via `peerDependencies`. Once enabled, the tools enter the model's tool list and are selectable with no further declaration.
+
+### Division of responsibilities: this plugin only “records” — “opening pages / acting” is up to a driver
+
+The plugin **does not operate pages itself** — it exposes only `recorder_start` / `recorder_stop` / `recorder_status`, and its job is to “watch and record”: it launches a monitored headed browser window and logs, as raw events, every UI operation and network request happening inside it. Actually “opening page XXXX and performing the steps” is done by a **browser driver**, which can be:
+
+1. **A human**: clicking / typing / navigating manually in the window the plugin popped up;
+2. **playwright MCP**: the model uses it to open pages, click, fill forms, and execute the target flow step by step;
+3. **Other browser-use style tools**: likewise acting as the “hands” that drive the browser through the flow.
+
+The model (agent) orchestrates the session: arm the recorder first, direct the driver to run the flow, then wrap up and read the artifacts.
+
+### Recommended flow with playwright MCP / browser-use (open page X → record the steps)
+
+1. **Arm the recorder**: `recorder_start("http://target-page")` — pops up the monitored browser and opens the start page; from this moment every operation and network request in the window is streamed to `events.jsonl`
+2. **Driver runs the flow**: let playwright MCP / browser-use (or a human) execute the whole target flow **inside the same monitored window** — opening pages, filling forms, clicking submit, going to the next page… both the UI events of each step and the API calls they trigger are captured
+3. **(Optional) check progress**: `recorder_status()` — whether recording, per-type event counts, artifact directory
+4. **Wrap up**: `recorder_stop()` — generates the `report.md` summary and closes the browser (closing the window manually also finalizes the session)
+5. **Analyze and distill**: the model reads `report.md` + `events.jsonl`, generalizes “flow steps × API calls × request/response contract”, and further distills it into a skill or an API-integration guide
+
+### Collaboration prerequisite (important)
+
+- Recording covers **the browser window started by the plugin itself** (including its new tabs / iframes); operations by any driver (human or automation) are only captured when they happen **inside this window**.
+- Today the window is started by the plugin and meant for direct human operation. To have playwright MCP / browser-use drive **the same** window, the driver must be able to attach to that browser instance (shared instance / CDP connection) — not built in yet, see “Known limitations” below.
+
+### Prerequisites and caveats
+
+- A browser must be installed locally: Edge by default (`channel: msedge`); `chrome` or a custom `executablePath` are configurable. The plugin never downloads a browser
+- At least one browser driver must be present: a human demo, or an automation tool such as playwright MCP / browser-use
+- The headed window is visible during recording by design, and closes when done
+- `events.jsonl` contains full request/response data (headers/bodies); treat it as sensitive and do not share it
 
 ## What gets recorded
 
@@ -89,7 +135,7 @@ If you are submitting an entry to awesome-dsh-plugin:
 
 ## Known limitations
 
-- Records only browser windows started by the plugin itself; it cannot record other browser instances you may already have open.
+- Records only the browser window started by the plugin itself (including its new tabs / iframes); operations in any other browser instance are not captured — including instances started by automation tools such as playwright MCP / browser-use. For automation-driven recording, the driver must attach to the same browser instance as the recorder (shared instance / CDP connection); this is not built in yet (roadmap item).
 - Sensitive request headers are redacted by default; request / response bodies get no content-level redaction (they may contain business data such as tokens), so treat `events.jsonl` as sensitive data and do not share it.
 - UI events in cross-origin iframes rely on init-script injection; pages with very strict CSP may block the injection (network events are unaffected).
 - When a click fires an API request and the page navigates away immediately, the browser cancels the response-body capture; the response body may then be missing for that request (the event itself is still recorded, just without a body).

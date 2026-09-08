@@ -5,3 +5,6 @@ pnpm-lock.yaml
 lib
 
 reports
+
+# awesome-dsh-plugin 投稿草稿(复制到 fork 的 data/plugins/ 用, 不入本仓库)
+submission
