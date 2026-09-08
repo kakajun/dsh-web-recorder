@@ -12,7 +12,7 @@
  * 安全默认: 请求头中的 cookie/authorization 等敏感头默认脱敏为 <redacted>;
  * 密码输入框的值不落盘(只记录输入动作本身); 请求/响应体截断到 maxBodyBytes。
  */
-import { realpathSync } from 'node:fs'
+import { mkdirSync, realpathSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
@@ -33,7 +33,7 @@ export const Config = z.object({
   channel: z.string().default('msedge'),
   // 自定义浏览器可执行文件路径, 非空时覆盖 channel
   executablePath: z.string().default(''),
-  // 录制产物输出根目录; 为空时默认仓库根 reports/recorder(reports/ 是仓库约定的运行产物目录, 不入库)
+  // 录制产物输出根目录; 为空时默认当前工作目录(用户正在操作的文件夹)下 reports/recorder
   outputDir: z.string().default(''),
   captureResponseBodies: z.boolean().default(true),
   maxBodyBytes: z.number().default(16384),
@@ -66,8 +66,20 @@ const __realDir = (() => {
     return __dirname
   }
 })()
-// 仓库根 reports/recorder(从 lib/ 上溯三级)
-const DEFAULT_OUTPUT_DIR = join(__realDir, '../../../reports/recorder')
+/**
+ * 默认产物根目录: 优先「用户正在操作的目录」——harness 会话(会话 cwd 即 SessionHeader.cwd,
+ * 会落到工具执行环境)与本仓库 CLI 都以用户目录为进程 cwd, 在其下建 reports/recorder;
+ * 该目录不可写时退回插件仓库根 reports/recorder(lib/ 在仓库根下一级, 上溯一级)。
+ */
+function resolveDefaultOutputDir(): string {
+  const cwdCandidate = join(process.cwd(), 'reports', 'recorder')
+  try {
+    mkdirSync(cwdCandidate, { recursive: true })
+    return cwdCandidate
+  } catch {
+    return join(__realDir, '../reports/recorder')
+  }
+}
 
 type StartSuccess = {
   ok: true
@@ -102,7 +114,7 @@ type StatusSuccess = {
 }
 
 export function apply(ctx: Context, config?: RecorderConfig): void {
-  const outputDir = config?.outputDir?.trim() || DEFAULT_OUTPUT_DIR
+  const outputDir = config?.outputDir?.trim() || resolveDefaultOutputDir()
   const opts = {
     channel: config?.channel ?? 'msedge',
     executablePath: config?.executablePath ?? '',

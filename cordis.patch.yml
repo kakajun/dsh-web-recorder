@@ -1,0 +1,5 @@
+# dsh 插件清单(被 package.json 的 dsh.bundle.patch 引用, 供市场/安装器把本插件并入 dsh profile)。
+# id 对应插件内部注册名(见 src/index.ts 的 export const name), name 为包名。
+- insert:
+  - id: dsh-web-recorder
+    name: dsh-web-recorder

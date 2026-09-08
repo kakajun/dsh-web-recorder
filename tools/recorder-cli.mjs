@@ -7,8 +7,7 @@
  * 用户直接关掉浏览器窗口也会自动收尾(reason: browser-closed)并退出。
  */
 import { existsSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 import { RecorderSession } from '../lib/index.js'
 
 const [url, stopFile] = process.argv.slice(2)
@@ -17,8 +16,8 @@ if (!stopFile) {
   process.exit(1)
 }
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..')
-const outputDir = join(root, 'reports', 'recorder')
+// 产物默认落在「用户正在操作的目录」(启动本 CLI 的终端目录)下的 reports/recorder
+const outputDir = join(process.cwd(), 'reports', 'recorder')
 
 const opts = {
   channel: 'msedge',
