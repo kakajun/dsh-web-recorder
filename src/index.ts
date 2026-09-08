@@ -28,20 +28,32 @@ export const inject = ['tools']
 // 额外导出供包级 tests/ 冒烟测试与高级调用方使用(函数插件只禁止默认导出)
 export { RecorderSession } from './session.ts'
 
+// Config 默认值与 apply 内兜底共用单一来源(schemastery 校验后会填充默认值)
+const RECORDER_DEFAULTS = {
+  channel: 'msedge',
+  executablePath: '',
+  outputDir: '',
+  captureResponseBodies: true,
+  maxBodyBytes: 16384,
+  recordConsole: false,
+  requestResourceTypes: 'xhr,fetch',
+  redactHeaders: 'cookie,authorization,proxy-authorization,x-api-key,set-cookie'
+} as const
+
 export const Config = z.object({
   // 浏览器渠道(playwright-core channel), 随部署机器变化, 可在 cordis.yml 覆盖
-  channel: z.string().default('msedge'),
+  channel: z.string().default(RECORDER_DEFAULTS.channel),
   // 自定义浏览器可执行文件路径, 非空时覆盖 channel
-  executablePath: z.string().default(''),
+  executablePath: z.string().default(RECORDER_DEFAULTS.executablePath),
   // 录制产物输出根目录; 为空时默认当前工作目录(用户正在操作的文件夹)下 reports/recorder
-  outputDir: z.string().default(''),
-  captureResponseBodies: z.boolean().default(true),
-  maxBodyBytes: z.number().default(16384),
-  recordConsole: z.boolean().default(false),
+  outputDir: z.string().default(RECORDER_DEFAULTS.outputDir),
+  captureResponseBodies: z.boolean().default(RECORDER_DEFAULTS.captureResponseBodies),
+  maxBodyBytes: z.number().default(RECORDER_DEFAULTS.maxBodyBytes),
+  recordConsole: z.boolean().default(RECORDER_DEFAULTS.recordConsole),
   // 只记录这些 resourceType 的网络请求(逗号分隔); 默认 xhr,fetch 即只录接口调用, 静态资源/文档不录
-  requestResourceTypes: z.string().default('xhr,fetch'),
+  requestResourceTypes: z.string().default(RECORDER_DEFAULTS.requestResourceTypes),
   // 需要脱敏的请求头名(逗号分隔, 大小写不敏感)
-  redactHeaders: z.string().default('cookie,authorization,proxy-authorization,x-api-key,set-cookie')
+  redactHeaders: z.string().default(RECORDER_DEFAULTS.redactHeaders)
 })
 
 /** apply 的配置入参类型(schemastery 无 z.infer, 与 Config 字段保持一致)。 */
@@ -116,19 +128,17 @@ type StatusSuccess = {
 export function apply(ctx: Context, config?: RecorderConfig): void {
   const outputDir = config?.outputDir?.trim() || resolveDefaultOutputDir()
   const opts = {
-    channel: config?.channel ?? 'msedge',
-    executablePath: config?.executablePath ?? '',
+    channel: config?.channel ?? RECORDER_DEFAULTS.channel,
+    executablePath: config?.executablePath ?? RECORDER_DEFAULTS.executablePath,
     outputDir,
-    captureResponseBodies: config?.captureResponseBodies ?? true,
-    maxBodyBytes: config?.maxBodyBytes ?? 16384,
-    recordConsole: config?.recordConsole ?? false,
-    requestResourceTypes: (config?.requestResourceTypes ?? 'xhr,fetch')
+    captureResponseBodies: config?.captureResponseBodies ?? RECORDER_DEFAULTS.captureResponseBodies,
+    maxBodyBytes: config?.maxBodyBytes ?? RECORDER_DEFAULTS.maxBodyBytes,
+    recordConsole: config?.recordConsole ?? RECORDER_DEFAULTS.recordConsole,
+    requestResourceTypes: (config?.requestResourceTypes ?? RECORDER_DEFAULTS.requestResourceTypes)
       .split(',')
       .map(t => t.trim())
       .filter(Boolean),
-    redactHeaders: (
-      config?.redactHeaders ?? 'cookie,authorization,proxy-authorization,x-api-key,set-cookie'
-    )
+    redactHeaders: (config?.redactHeaders ?? RECORDER_DEFAULTS.redactHeaders)
       .split(',')
       .map(h => h.trim().toLowerCase())
       .filter(Boolean)
@@ -205,7 +215,7 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           ]
         }
       },
-      async execute(args): Promise<StartResult> {
+      async execute(args, exec): Promise<StartResult> {
         clearFinished()
         if (session) {
           return toolError({
@@ -215,8 +225,17 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           })
         }
         const url = typeof args.url === 'string' && args.url.trim() ? args.url.trim() : undefined
+        // 尊重 exec.signal: 调用已被取消时不再启动浏览器
+        if (exec.signal.aborted) {
+          return toolError({
+            type: 'internal',
+            message: '录制启动已取消',
+            hint: '如仍需录制请重新调用 recorder_start'
+          })
+        }
+        let started: RecorderSession
         try {
-          session = await RecorderSession.start(url, opts)
+          started = await RecorderSession.start(url, opts)
         } catch (cause) {
           return toolError({
             type: 'browser',
@@ -224,6 +243,16 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
             hint: `请确认本机安装了 ${opts.channel === 'msedge' ? 'Edge' : opts.channel} 浏览器, 或在插件 Config 中设置 executablePath/channel`
           })
         }
+        // 启动期间调用被取消: 不收留会话, 立即收尾释放浏览器
+        if (exec.signal.aborted) {
+          void started.stop('aborted')
+          return toolError({
+            type: 'internal',
+            message: '录制启动已取消',
+            hint: '如仍需录制请重新调用 recorder_start'
+          })
+        }
+        session = started
         return {
           ok: true,
           sessionDir: session.sessionDir,
@@ -368,4 +397,16 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
       }
     })
   )
+
+  // 注册即 effect: 插件被卸载(禁用/HMR/进程收尾)时, 兜底收尾仍在进行的录制,
+  // 不残留浏览器进程; disposer 逆序执行且卸载会 await 异步 disposer。
+  ctx.effect(() => {
+    return () => {
+      const active = session
+      session = null
+      if (active && !active.isFinished()) {
+        return active.stop('plugin-disposed')
+      }
+    }
+  })
 }

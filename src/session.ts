@@ -119,7 +119,10 @@ export class RecorderSession {
     startUrl: string | undefined,
     opts: RecorderOptions
   ): Promise<RecorderSession> {
-    const dirName = `rec-${new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19)}`
+    const now = new Date()
+    const pad2 = (n: number): string => String(n).padStart(2, '0')
+    // 目录名 rec-HH-mm-ss: 本地时间时分秒, 简短易分辨
+    const dirName = `rec-${pad2(now.getHours())}-${pad2(now.getMinutes())}-${pad2(now.getSeconds())}`
     const session = new RecorderSession(opts, join(opts.outputDir, dirName))
     try {
       session.browser = await chromium.launch({

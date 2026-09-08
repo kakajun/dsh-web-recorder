@@ -1,10 +1,13 @@
 {
   "name": "dsh-web-recorder",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Browser-recording tools for DSH: opens a headed Edge window to record real clicks, inputs, navigation and network requests in a user-guided session, then generates a Markdown operation-timeline report (report.md with redacted request/response bodies and asset list) for the model to analyze and reproduce.",
   "license": "MIT",
   "main": "lib/index.js",
+  "engines": {
+    "node": ">=18"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/kakajun/dsh-web-recorder"
