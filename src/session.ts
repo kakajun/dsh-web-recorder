@@ -99,6 +99,8 @@ export class RecorderSession {
   private context?: BrowserContext
   private pageIds = new Map<Page, number>()
   private nextPageId = 1
+  private openPages = 0
+  private noPageTimer?: ReturnType<typeof setTimeout>
   private requestIds = new Map<Request, number>()
   private pendingBodies = new Set<Promise<void>>()
   private stoppingReason?: string
@@ -137,6 +139,8 @@ export class RecorderSession {
       session.context.on('page', page => session.attachPage(page))
       // 用户直接关掉浏览器时自动收尾, 已录数据不丢; stop() 主动关窗时用 stop 的真实原因
       session.browser.on('disconnected', () => {
+        if (session.noPageTimer) clearTimeout(session.noPageTimer)
+        session.noPageTimer = undefined
         void session.finalize(session.stoppingReason ?? 'browser-closed')
       })
       for (const page of session.context.pages()) session.attachPage(page)
@@ -198,6 +202,13 @@ export class RecorderSession {
   private attachPage(page: Page): void {
     if (this.pageIds.has(page)) return
     this.pageIds.set(page, this.nextPageId++)
+    this.openPages++
+    // 任何窗口/标签被关都立刻感知: 计数归零后延迟确认(允许操作途中短暂无页面),
+    // 仍无页面则视为用户关闭浏览器, 自动收尾生成报告(兜底 disconnected 未触发的情况)。
+    page.on('close', () => {
+      this.openPages = Math.max(0, this.openPages - 1)
+      this.scheduleNoPageCheck()
+    })
     page.on('framenavigated', frame => {
       if (frame === page.mainFrame())
         this.push({ type: 'navigate', pageId: this.pageIds.get(page), url: page.url() })
@@ -286,6 +297,24 @@ export class RecorderSession {
     }
   }
 
+  /**
+   * 页面全部关闭后的自动收尾检查: 延迟 800ms 给「关了一个 tab 又立刻新开」留缓冲,
+   * 之后仍无存活页面则视为用户关闭浏览器, 立即 finalize 生成报告;
+   * 若浏览器进程仍连接着(如 Windows 上 Edge/Chrome 关窗口后进程后台驻留,
+   * disconnected 迟迟不触发), 顺带关闭进程避免残留。与 disconnected 路径幂等。
+   */
+  private scheduleNoPageCheck(): void {
+    if (this.stopResult || this.openPages > 0) return
+    if (this.noPageTimer) clearTimeout(this.noPageTimer)
+    this.noPageTimer = setTimeout(() => {
+      this.noPageTimer = undefined
+      if (this.stopResult || this.openPages > 0) return
+      void this.finalize(this.stoppingReason ?? 'browser-closed').finally(() => {
+        if (this.browser?.isConnected()) void this.browser.close().catch(() => undefined)
+      })
+    }, 800)
+  }
+
   private pushUi(page: Page, payload: UiPayload): void {
     const pageId = this.pageIds.get(page)
     const url = page.url()
@@ -351,12 +380,18 @@ export class RecorderSession {
     if (this.stopResult) return this.stopResult
     const endedAt = Date.now()
     const reportPath = join(this.sessionDir, 'report.md')
-    const report = generateMarkdown(this.events, {
-      startedAt: this.startedAt,
-      endedAt,
-      reason,
-      sessionDir: this.sessionDir
-    })
+    // 报告生成/写盘失败都不阻断收尾: stopResult 必须被设置, 否则收尾会静默丢失
+    let report: string
+    try {
+      report = generateMarkdown(this.events, {
+        startedAt: this.startedAt,
+        endedAt,
+        reason,
+        sessionDir: this.sessionDir
+      })
+    } catch {
+      report = `# 报告生成失败\n\n- 结束原因: ${reason}\n- 已记录事件: ${this.events.length} 个\n- 明细见 events.jsonl\n`
+    }
     try {
       await writeFile(reportPath, report, 'utf8')
     } catch {
