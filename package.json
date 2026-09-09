@@ -1,13 +1,18 @@
 {
   "name": "dsh-web-recorder",
-  "version": "0.1.1",
-  "type": "module",
+  "version": "0.1.2",
   "description": "Browser-recording tools for DSH: opens a headed Edge window to record real clicks, inputs, navigation and network requests in a user-guided session, then generates a Markdown operation-timeline report (report.md with redacted request/response bodies and asset list) for the model to analyze and reproduce.",
+  "keywords": [
+    "DSH",
+    "browser",
+    "deepseek",
+    "deepseek harness",
+    "dsh-plugin",
+    "recorder",
+    "web recorder"
+  ],
   "license": "MIT",
-  "main": "lib/index.js",
-  "engines": {
-    "node": ">=18"
-  },
+  "author": "kakajun <253495832@qq.com>",
   "repository": {
     "type": "git",
     "url": "https://github.com/kakajun/dsh-web-recorder"
@@ -18,6 +23,8 @@
     "README.md",
     "README_EN.md"
   ],
+  "type": "module",
+  "main": "lib/index.js",
   "scripts": {
     "build": "tsdown",
     "prepublishOnly": "pnpm build",
@@ -27,16 +34,6 @@
     "test:watch": "vitest",
     "smoke": "node tests/smoke.mjs",
     "smoke:cdp": "node tests/smoke-cdp.mjs"
-  },
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0",
-    "@deepseek-ai/schemastery": "^3.18.2"
   },
   "dependencies": {
     "playwright-core": "^1.49.1"
@@ -49,5 +46,18 @@
     "tsdown": "^0.23.0",
     "typescript": "^5.9.3",
     "vitest": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   }
 }
