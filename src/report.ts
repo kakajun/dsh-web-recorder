@@ -2,6 +2,7 @@
  * 录制报告生成: 从内存事件序列生成 Markdown 报告。
  * 报告是给人/模型快速浏览的摘要; 完整数据(含请求头、请求体、响应体)在 events.jsonl。
  */
+import { countEvents } from './stats.ts'
 import type { RecordedEvent } from './types.ts'
 
 interface ReportMeta {
@@ -48,20 +49,10 @@ export function generateMarkdown(events: RecordedEvent[], meta: ReportMeta): str
   lines.push(`- 数据目录: ${meta.sessionDir}`)
   lines.push('')
 
-  // ---- 统计概览 ----
-  const counts = {
-    navigate: 0,
-    click: 0,
-    change: 0,
-    submit: 0,
-    request: 0,
-    response: 0,
-    requestfailed: 0,
-    console: 0
-  }
+  // ---- 统计概览 ---- (与会话侧 status() 共用一套计数口径)
+  const counts = countEvents(events)
   const statusClass = new Map<string, number>()
   for (const e of events) {
-    counts[e.type]++
     if (e.type === 'response') {
       const cls = `${Math.floor(e.status / 100)}xx`
       statusClass.set(cls, (statusClass.get(cls) ?? 0) + 1)
@@ -71,12 +62,12 @@ export function generateMarkdown(events: RecordedEvent[], meta: ReportMeta): str
   lines.push('')
   lines.push('| 类别 | 数量 |')
   lines.push('| --- | --- |')
-  lines.push(`| 页面导航 | ${counts.navigate} |`)
-  lines.push(`| 点击 | ${counts.click} |`)
-  lines.push(`| 输入/选择变更 | ${counts.change} |`)
-  lines.push(`| 表单提交 | ${counts.submit} |`)
-  lines.push(`| 网络请求 | ${counts.request} |`)
-  lines.push(`| 请求失败 | ${counts.requestfailed} |`)
+  lines.push(`| 页面导航 | ${counts.navigations} |`)
+  lines.push(`| 点击 | ${counts.clicks} |`)
+  lines.push(`| 输入/选择变更 | ${counts.changes} |`)
+  lines.push(`| 表单提交 | ${counts.submits} |`)
+  lines.push(`| 网络请求 | ${counts.requests} |`)
+  lines.push(`| 请求失败 | ${counts.failed} |`)
   if (statusClass.size > 0) {
     lines.push(
       `| 响应状态分布 | ${[...statusClass.entries()].map(([k, v]) => `${k}:${v}`).join(' ')} |`
@@ -151,8 +142,10 @@ export function generateMarkdown(events: RecordedEvent[], meta: ReportMeta): str
   if (failures.size > 0) {
     lines.push('## 失败请求')
     lines.push('')
+    // 按 requestId 建索引, 避免每个失败请求都线性扫描整表(O(n^2))
+    const requestsById = new Map(requests.map(r => [r.requestId, r]))
     for (const [id, errorText] of failures) {
-      const req = requests.find(r => r.requestId === id)
+      const req = requestsById.get(id)
       lines.push(`- #${id} ${req ? `${req.method} ${shortUrl(req.url)}` : ''}: ${errorText}`)
     }
     lines.push('')

@@ -60,11 +60,19 @@ src/
               监听 click/change/submit, 经 exposeBinding 回传 UI 事件; attach 模式对已加载页面
               直接 evaluate 补装)、监听 request/response/requestfailed/console 事件, 事件内存留存
               + 逐行写 events.jsonl; stop() 幂等收尾, 浏览器被关闭时自动 finalize。
+              finalize 经 finalizePromise 去重(stop / 关窗口 / 插件卸载可能并发触发), 只跑一次。
   report.ts   generateMarkdown(events, meta): 从事件序列生成 Markdown 摘要
               (统计概览 + 操作时间线 + 网络请求明细表 + 失败请求), 纯函数。
   types.ts    RecordedEvent 联合类型(navigate/click/change/submit/request/response/
               requestfailed/console)、RecorderOptions、SessionStats、StopResult、
               ToolError/toolError 错误信封。
+  stats.ts    SessionStats 计数的单一口径: createSessionStats / accumulateEvent(会话 push 时增量累加) /
+              countEvents(报告一次性统计), 两处共用, 避免口径漂移。
+  init-script.ts  注入页面的 UI 事件采集脚本 INIT_SCRIPT(click/change/submit 捕获 + selector/label 提取)。
+  browser-discovery.ts  Playwright MCP 浏览器的发现与接管(仅 Windows 实现: PowerShell CIM 查
+              user-data-dir、读 DevToolsActivePort 得 CDP 端口、读 Chrome Sessions 的 Tabs 文件取最近
+              URL、kill 后轮询等进程退出); createMcpBrowserProbe() 返回探针, 同一次 start 内缓存
+              user-data-dir(避免重复 spawn), 非 Windows 一律返回 undefined 直接回退新开窗口。
 lib/          tsdown 构建产物(已 gitignore), 入口 lib/index.js
 tests/
   report.test.ts  vitest 单元测试, 直接跑 TS 源码(无需 build), 只测 generateMarkdown
@@ -89,13 +97,16 @@ assets/           README 截图与封面
 - 配置默认值单一来源：`RECORDER_DEFAULTS`（`src/index.ts`），schemastery schema 与 `apply` 兜底不得各自硬编码。
 - 错误返回统一走 `toolError({type, message, hint})` 信封（`type: 'state' | 'browser' | 'internal'`），工具的 `output.render` 负责把结果渲染成给模型看的文本。
 - `RecorderSession.stop()` / `finalize()` 必须幂等：用户关浏览器、插件卸载、`recorder_stop` 三条路径会并发触发收尾，`stopResult` 只允许设置一次；报告生成/写盘失败不得阻断收尾。
+- 页面/请求映射（`pageIds` / `requestIds`）用 `WeakMap`：不持强引用，长时间录制不会把已关闭的页面与已完成请求堆积在内存；请求失败（终态）时主动 `delete`。
+- 事件计数只走 `src/stats.ts`：会话侧 `push` 时增量累加，报告侧 `countEvents` 一次性统计，两处不得各写一份 `switch`。
+- 启动中途失败要释放已建的浏览器与事件流；attach 失败同样要断开已建立的连接（`start` / `tryAttach` 的 catch 里处理）。
 - 保留 `console.log` 等调试输出，仅在明确要求时删除。
 - Node 版本由 fnm 管理（`D:\fnm\node-versions`，`fnm list` 查看）。
 - 运行时产物默认落在**当前工作目录**（harness 会话 cwd）下 `reports/recorder/rec-<HH-mm-ss>/`，该目录不可写时退回插件仓库根的 `reports/recorder`；`reports/` 已 gitignore。
 
 ## 测试策略
 
-- **单元测试**（`pnpm test`）：vitest，只覆盖 `report.ts` 的 `generateMarkdown` 纯函数，直接运行 TS 源码无需构建。
+- **单元测试**（`pnpm test`）：vitest，直接运行 TS 源码无需构建。覆盖 `report.ts` 的 `generateMarkdown` 纯函数（`tests/report.test.ts`）与 `stats.ts` 的计数口径（`tests/stats.test.ts`）。
 - **端到端冒烟**（`pnpm smoke` / `pnpm smoke:cdp` / `pnpm smoke:mcp`）：非测试框架的手工脚本，需要本机安装 Edge（或 Chrome）。三者分别覆盖新开窗口录制、显式 cdpUrl attach、MCP 浏览器 CDP 端口自动发现 attach；`smoke:cdp`/`smoke:mcp` 还断言 `stop` 后外部浏览器进程不被关闭。断言 `events.jsonl` 与 `report.md` 内容（点击/输入/请求/响应/脱敏）。
 - 修改 `session.ts` 事件采集逻辑后，应跑 `pnpm build && pnpm smoke`（CDP 相关改动另跑 `pnpm smoke:cdp`）验证；修改 `report.ts` 至少跑 `pnpm test` + `pnpm typecheck`。
 
@@ -105,7 +116,7 @@ assets/           README 截图与封面
 - 密码输入框的值不落盘，只记录输入动作（`redacted: true`）。
 - 请求体/响应体截断到 `maxBodyBytes`（默认 16384）。
 - **请求体/响应体不做内容级脱敏**（可能含 token 等业务数据）——`events.jsonl` 含完整请求头/体，按敏感数据处理，勿外发、勿提交到仓库（`reports/` 已 gitignore，注意保持）。
-- `session.ts` 中有针对 Playwright MCP 浏览器的检测/接管逻辑（Windows 专用：经 PowerShell CIM 查进程、读 `DevToolsActivePort` 自动发现 CDP 端口并 attach、读 Chrome Sessions 的 Tabs 文件提取 URL、taskkill 关闭旧进程）——涉及杀进程，改动需格外谨慎。
+- `src/browser-discovery.ts` 中有针对 Playwright MCP 浏览器的检测/接管逻辑（Windows 专用：经 PowerShell CIM 查进程、读 `DevToolsActivePort` 自动发现 CDP 端口并 attach、读 Chrome Sessions 的 Tabs 文件提取 URL、`Stop-Process` 关闭旧进程）——涉及杀进程，改动需格外谨慎；非 Windows 平台该模块整体返回 `undefined`（回退新开窗口），不要为非 Windows 引入会误杀进程的实现。
 
 ## 环境
 

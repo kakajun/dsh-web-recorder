@@ -2,10 +2,9 @@
  * 录制会话核心: 启动有头浏览器, 监听 UI 事件(点击/输入/提交)与网络事件(请求/响应/失败),
  * 内存留存全部事件供报告生成, 同时逐行写入 events.jsonl 防止进程崩溃丢数据。
  */
-import { createWriteStream, existsSync, mkdirSync, readFileSync, type WriteStream } from 'node:fs'
+import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { execSync } from 'node:child_process'
 import {
   chromium,
   type Browser,
@@ -14,7 +13,10 @@ import {
   type Page,
   type Request
 } from 'playwright-core'
+import { createMcpBrowserProbe } from './browser-discovery.ts'
+import { INIT_SCRIPT } from './init-script.ts'
 import { generateMarkdown } from './report.ts'
+import { accumulateEvent, createSessionStats } from './stats.ts'
 import type {
   RecordedEvent,
   RecorderOptions,
@@ -24,70 +26,6 @@ import type {
   UnstampedEvent
 } from './types.ts'
 
-/** 注入页面的 UI 事件采集脚本: 捕获阶段监听 click/change/submit, 经 exposeBinding 回传。 */
-const INIT_SCRIPT = `(() => {
-  if (window.__huafengRecorderInstalled) return
-  window.__huafengRecorderInstalled = true
-  const send = (p) => {
-    try {
-      if (window.__huafengRecordUIEvent) window.__huafengRecordUIEvent(p)
-    } catch (e) { /* 绑定不可用时静默丢弃 */ }
-  }
-  const selectorOf = (el) => {
-    const parts = []
-    let cur = el
-    while (cur && cur.tagName && parts.length < 5) {
-      let part = cur.tagName.toLowerCase()
-      if (cur.id) {
-        parts.unshift(part + '#' + cur.id)
-        break
-      }
-      if (typeof cur.className === 'string' && cur.className.trim()) {
-        part += '.' + cur.className.trim().split(/\\s+/).slice(0, 2).join('.')
-      }
-      parts.unshift(part)
-      cur = cur.parentElement
-    }
-    return parts.join(' > ')
-  }
-  const labelOf = (el) =>
-    (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('placeholder') || '')
-      .replace(/\\s+/g, ' ')
-      .trim()
-      .slice(0, 80)
-  document.addEventListener('click', (e) => {
-    const raw = e.target
-    if (!raw || !raw.tagName) return
-    const el = raw.closest ? raw.closest('button, a, [role="button"], input, select, textarea, [onclick]') || raw : raw
-    send({
-      kind: 'click',
-      selector: selectorOf(el),
-      tag: (el.tagName || '').toLowerCase(),
-      text: labelOf(el) || undefined,
-      x: Math.round(e.clientX),
-      y: Math.round(e.clientY),
-    })
-  }, true)
-  document.addEventListener('change', (e) => {
-    const el = e.target
-    if (!el || !el.tagName) return
-    const isPassword = el.type === 'password'
-    send({
-      kind: 'change',
-      selector: selectorOf(el),
-      tag: el.tagName.toLowerCase(),
-      name: el.name || undefined,
-      value: isPassword ? undefined : String(el.value == null ? '' : el.value).slice(0, 200),
-      redacted: isPassword || undefined,
-    })
-  }, true)
-  document.addEventListener('submit', (e) => {
-    const el = e.target
-    if (!el || !el.tagName) return
-    send({ kind: 'submit', selector: selectorOf(el) })
-  }, true)
-})()`
-
 export class RecorderSession {
   readonly startedAt = Date.now()
   readonly sessionDir: string
@@ -96,20 +34,25 @@ export class RecorderSession {
   private seq = 0
   private requestSeq = 0
   private events: RecordedEvent[] = []
+  /** 分类计数随 push 增量维护, status()/报告不必再全量遍历事件 */
+  private counts = createSessionStats()
   private jsonl: WriteStream
   private browser?: Browser
   private context?: BrowserContext
   /** CDP attach 模式下为 true, 此时不主动关闭浏览器进程 */
   private attached = false
   private cdpSession?: CDPSession
-  private pageIds = new Map<Page, number>()
+  // 页面/请求用 WeakMap: 不持有强引用, 页面关闭或请求结束后条目可被回收, 长时间录制不堆积
+  private pageIds = new WeakMap<Page, number>()
   private nextPageId = 1
   private openPages = 0
   private noPageTimer?: ReturnType<typeof setTimeout>
-  private requestIds = new Map<Request, number>()
+  private requestIds = new WeakMap<Request, number>()
   private pendingBodies = new Set<Promise<void>>()
   private stoppingReason?: string
   private stopResult?: StopResult
+  /** 收尾的进行中 promise: stop / 关窗口 / 插件卸载可能并发触发, 只执行一次 */
+  private finalizePromise?: Promise<StopResult>
 
   private constructor(opts: RecorderOptions, sessionDir: string) {
     this.opts = opts
@@ -120,7 +63,7 @@ export class RecorderSession {
   }
 
   /**
-   * 启动浏览器并完成全部监听挂载; 失败时清理已建目录流。
+   * 启动浏览器并完成全部监听挂载; 失败时关闭已起的浏览器与事件流, 不残留进程/句柄。
    * attach 优先级: 显式配置的 cdpUrl → 自动发现 Playwright MCP 浏览器的 CDP 端口
    * (读取其 user-data-dir 下的 DevToolsActivePort, 需 MCP 以 --remote-debugging-port 启动);
    * 两者都不可用时回退到接管模式: 读取 MCP 浏览器当前页面 URL, 关闭旧浏览器,
@@ -135,24 +78,21 @@ export class RecorderSession {
     // 目录名 rec-HH-mm-ss: 本地时间时分秒, 简短易分辨
     const dirName = `rec-${pad2(now.getHours())}-${pad2(now.getMinutes())}-${pad2(now.getSeconds())}`
     const session = new RecorderSession(opts, join(opts.outputDir, dirName))
+    // 探测 MCP 浏览器的开销(spawn PowerShell CIM 查询)在一次启动内只付一次: attach 与接管共用探针
+    const probe = createMcpBrowserProbe()
     try {
       // 1. 显式配置的 CDP 地址优先
       let attached = await session.tryAttach(opts.cdpUrl?.trim())
       let playwrightMcpUrl: string | undefined
       if (!attached) {
         // 2. 自动发现 Playwright MCP 浏览器的 CDP 端口, attach 到用户正在使用的窗口
-        const mcpCdpUrl = session.discoverMcpCdpUrl()
+        const mcpCdpUrl = probe.discoverCdpUrl()
         if (mcpCdpUrl) attached = await session.tryAttach(mcpCdpUrl)
       }
       if (!attached) {
-        // 3. 回退接管: 检测 Playwright MCP 浏览器, 关掉后用 recorder 新开窗口
-        playwrightMcpUrl = session.detectPlaywrightMcpBrowser()
-        if (playwrightMcpUrl) {
-          // 关闭 Playwright MCP 浏览器进程
-          session.killPlaywrightMcpBrowser()
-          // 等待进程退出
-          await new Promise(resolve => setTimeout(resolve, 1500))
-        }
+        // 3. 回退接管: 检测 Playwright MCP 浏览器, 关掉(并等其退出)后用 recorder 新开窗口
+        playwrightMcpUrl = probe.lastVisitedUrl()
+        if (playwrightMcpUrl) await probe.closeAndWait()
         // 新开浏览器窗口(优先使用接管的 URL)
         session.browser = await chromium.launch({
           headless: false,
@@ -177,14 +117,13 @@ export class RecorderSession {
         }
       }
       session.context!.on('page', page => session.attachPage(page))
-      // 用户直接关掉浏览器时自动收尾, 已录数据不丢; stop() 主动关窗时用 stop 的真实原因
-      if (!session.attached) {
-        session.browser!.on('disconnected', () => {
-          if (session.noPageTimer) clearTimeout(session.noPageTimer)
-          session.noPageTimer = undefined
-          void session.finalize(session.stoppingReason ?? 'browser-closed')
-        })
-      }
+      // 浏览器进程退出时自动收尾, 已录数据不丢; stop() 主动关窗时也会触发(此时用 stop 的真实原因);
+      // attach 模式下则表示外部浏览器(MCP 浏览器)被关掉, 同样需要收尾。finalize 幂等。
+      session.browser!.on('disconnected', () => {
+        if (session.noPageTimer) clearTimeout(session.noPageTimer)
+        session.noPageTimer = undefined
+        void session.finalize(session.stoppingReason ?? 'browser-closed')
+      })
       for (const page of session.context!.pages()) session.attachPage(page)
       // attach 模式只在调用方显式传入 URL 时才导航当前页, 否则保持用户正在看的页面不动
       const finalUrl = startUrl?.trim() || playwrightMcpUrl
@@ -194,137 +133,10 @@ export class RecorderSession {
       }
       return session
     } catch (cause) {
+      // 启动中途失败: 已起的浏览器要关掉(attach 模式只是断开连接), 事件流也要收口
+      if (session.browser) await session.browser.close().catch(() => undefined)
       session.jsonl.end()
       throw cause
-    }
-  }
-
-  /**
-   * 执行 PowerShell 脚本并返回 stdout。统一走 -EncodedCommand(UTF-16LE base64):
-   * 脚本内含双引号(如正则 [^\s"])时, -Command "..." 经 cmd.exe + powershell 双层引号
-   * 解析会断裂静默失败, EncodedCommand 完全绕开该问题。
-   */
-  private runPowerShell(script: string): string {
-    const encoded = Buffer.from(script, 'utf16le').toString('base64')
-    return execSync(`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`, {
-      encoding: 'utf8',
-      timeout: 10000
-    })
-  }
-
-  /** 查找正在运行的 Playwright MCP 浏览器的 user-data-dir(Windows: PowerShell CIM 查进程命令行)。 */
-  private findMcpUserDataDir(): string | undefined {
-    try {
-      // Windows: 通过 PowerShell CIM 查找包含 ms-playwright-mcp 的浏览器进程
-      const psScript = `
-        Get-CimInstance Win32_Process | Where-Object {
-          ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') -and
-          $_.CommandLine -match 'ms-playwright-mcp' -and
-          $_.CommandLine -notmatch '--type='
-        } | ForEach-Object {
-          if ($_.CommandLine -match '--user-data-dir="?([^\\s"]+)') { $Matches[1] }
-        } | Select-Object -First 1
-      `
-      const userDataDir = this.runPowerShell(psScript).trim()
-      return userDataDir || undefined
-    } catch {
-      return undefined
-    }
-  }
-
-  /**
-   * 自动发现 Playwright MCP 浏览器的 CDP 地址: MCP 以 --remote-debugging-port 启动时,
-   * Chrome 会把实际端口写入 user-data-dir 下的 DevToolsActivePort 文件(第一行)。
-   * 读到则返回 http://127.0.0.1:<port>, 供 tryAttach 直接 attach 到用户正在使用的窗口。
-   */
-  private discoverMcpCdpUrl(): string | undefined {
-    try {
-      const userDataDir = this.findMcpUserDataDir()
-      if (!userDataDir) return undefined
-      const portFile = join(userDataDir, 'DevToolsActivePort')
-      if (!existsSync(portFile)) return undefined
-      const port = Number(readFileSync(portFile, 'utf8').split('\n')[0]?.trim())
-      if (!Number.isInteger(port) || port <= 0) return undefined
-      return `http://127.0.0.1:${port}`
-    } catch {
-      return undefined
-    }
-  }
-
-  /**
-   * 检测是否有 Playwright MCP 浏览器在运行(通过查找 ms-playwright-mcp user-data-dir 的进程)。
-   * 若找到, 从其 Chrome Tabs 文件中提取最近访问的 URL 并返回; 否则返回 undefined。
-   */
-  private detectPlaywrightMcpBrowser(): string | undefined {
-    const userDataDir = this.findMcpUserDataDir()
-    if (!userDataDir) return undefined
-    // 从 Chrome Tabs 文件中提取最近访问的 URL
-    return this.extractUrlFromTabs(userDataDir)
-  }
-
-  /** 从 Chrome 的 Sessions 目录中提取最近访问的 URL(读取 Tabs 文件, 其中包含明文 URL)。 */
-  private extractUrlFromTabs(userDataDir: string): string | undefined {
-    try {
-      const sessionsDir = join(userDataDir, 'Default', 'Sessions')
-      if (!existsSync(sessionsDir)) return undefined
-
-      // 找最新的非空 Tabs 文件
-      const files = execSync(`dir /b /o-d "${sessionsDir}\\Tabs_*" 2>nul`, {
-        encoding: 'utf8',
-        timeout: 5000,
-        shell: 'cmd.exe'
-      })
-        .split('\n')
-        .map(f => f.trim())
-        .filter(f => f.startsWith('Tabs_'))
-      if (files.length === 0) return undefined
-
-      for (const file of files) {
-        const filePath = join(sessionsDir, file)
-        try {
-          const bytes = readFileSync(filePath)
-          if (bytes.length === 0) continue
-          const content = bytes.toString('ascii')
-          // 匹配 http/https URL, 优先取带路径的(排除纯域名)
-          const urls = content.match(/https?:\/\/[^\x00-\x1F\x7F\s"'<>]+/g) || []
-          // 过滤: 优先选择包含路径的 URL(不只是域名)
-          const withPath = urls.filter(u => {
-            try {
-              const url = new URL(u)
-              return url.pathname !== '/' && url.pathname !== ''
-            } catch {
-              return false
-            }
-          })
-          if (withPath.length > 0) {
-            // 去重并返回最后一个(通常是最新访问的)
-            const unique = [...new Set(withPath)]
-            return unique[unique.length - 1]
-          }
-        } catch {
-          continue
-        }
-      }
-      return undefined
-    } catch {
-      return undefined
-    }
-  }
-
-  /** 关闭 Playwright MCP 浏览器进程(通过 PowerShell Stop-Process)。 */
-  private killPlaywrightMcpBrowser(): void {
-    try {
-      const psScript = `
-        Get-CimInstance Win32_Process | Where-Object {
-          ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') -and
-          $_.CommandLine -match 'ms-playwright-mcp'
-        } | ForEach-Object {
-          Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-        }
-      `
-      this.runPowerShell(psScript)
-    } catch {
-      // 忽略错误, 即使关闭失败也继续新开浏览器
     }
   }
 
@@ -341,13 +153,17 @@ export class RecorderSession {
         this.context = await this.browser.newContext({ viewport: null })
       }
       // CDP attach 模式下, 通过 CDP session 监听浏览器关闭
-      this.cdpSession = await this.context.newCDPSession(this.context.pages()[0] ?? (await this.context.newPage()))
+      this.cdpSession = await this.context.newCDPSession(
+        this.context.pages()[0] ?? (await this.context.newPage())
+      )
       this.cdpSession.on('Inspector.targetCrashed', () => {
         void this.finalize(this.stoppingReason ?? 'browser-crashed')
       })
       return true
     } catch {
-      // attach 失败, 清理并返回 false 让调用方回退到 launch
+      // attach 失败(也可能是连上后建 CDP session 失败): 断开已建立的连接再清理,
+      // 返回 false 让调用方回退到 launch
+      if (this.browser) await this.browser.close().catch(() => undefined)
       this.browser = undefined
       this.context = undefined
       this.cdpSession = undefined
@@ -395,11 +211,15 @@ export class RecorderSession {
   async stop(reason: string): Promise<StopResult> {
     if (this.stopResult) return this.stopResult
     this.stoppingReason = reason
+    // 宽限计时器 unref: 响应体都回来时不让它拖住进程退出
+    await Promise.race([
+      Promise.allSettled([...this.pendingBodies]),
+      new Promise<void>(resolve => {
+        const timer = setTimeout(resolve, 2000)
+        timer.unref?.()
+      })
+    ])
     try {
-      await Promise.race([
-        Promise.allSettled([...this.pendingBodies]),
-        new Promise<void>(resolve => setTimeout(resolve, 2000))
-      ])
       if (this.attached) {
         // CDP attach 模式: 不关闭浏览器进程, 只断开 CDP 连接
         if (this.cdpSession) await this.cdpSession.detach().catch(() => undefined)
@@ -408,9 +228,10 @@ export class RecorderSession {
         if (this.context) await this.context.close().catch(() => undefined)
         if (this.browser) await this.browser.close().catch(() => undefined)
       }
-    } finally {
-      return this.finalize(reason)
+    } catch {
+      // 关闭失败不阻断收尾: 报告与 stopResult 仍要产出
     }
+    return this.finalize(reason)
   }
 
   private attachPage(page: Page): void {
@@ -420,6 +241,7 @@ export class RecorderSession {
     // 任何窗口/标签被关都立刻感知: 计数归零后延迟确认(允许操作途中短暂无页面),
     // 仍无页面则视为用户关闭浏览器, 自动收尾生成报告(兜底 disconnected 未触发的情况)。
     page.on('close', () => {
+      this.pageIds.delete(page)
       this.openPages = Math.max(0, this.openPages - 1)
       this.scheduleNoPageCheck()
     })
@@ -491,6 +313,8 @@ export class RecorderSession {
     page.on('requestfailed', request => {
       const requestId = this.requestIds.get(request)
       if (requestId === undefined) return
+      // 失败即终态: 该请求不会再有响应事件, 可以释放映射(WeakMap 之外再主动清)
+      this.requestIds.delete(request)
       this.push({
         type: 'requestfailed',
         pageId: this.pageIds.get(page),
@@ -563,35 +387,31 @@ export class RecorderSession {
     if (this.stopResult) return
     const full = { ...event, seq: ++this.seq, ts: Date.now() } as RecordedEvent
     this.events.push(full)
+    accumulateEvent(this.counts, full.type)
     this.jsonl.write(JSON.stringify(full) + '\n')
   }
 
+  /** 当前分类计数(增量维护的结果, 只做一次浅拷贝, 不再遍历事件)。 */
   private stats(): SessionStats {
-    const stats: SessionStats = {
-      navigations: 0,
-      clicks: 0,
-      changes: 0,
-      submits: 0,
-      requests: 0,
-      responses: 0,
-      failed: 0,
-      console: 0
-    }
-    for (const e of this.events) {
-      if (e.type === 'navigate') stats.navigations++
-      else if (e.type === 'click') stats.clicks++
-      else if (e.type === 'change') stats.changes++
-      else if (e.type === 'submit') stats.submits++
-      else if (e.type === 'request') stats.requests++
-      else if (e.type === 'response') stats.responses++
-      else if (e.type === 'requestfailed') stats.failed++
-      else if (e.type === 'console') stats.console++
-    }
-    return stats
+    return { ...this.counts }
   }
 
-  private async finalize(reason: string): Promise<StopResult> {
+  /**
+   * 收尾入口: stop / 用户关窗口 / 插件卸载三条路径可能并发触发,
+   * 用 finalizePromise 保证真正的收尾动作只跑一次, 后续调用复用同一结果。
+   */
+  private finalize(reason: string): Promise<StopResult> {
+    this.finalizePromise ??= this.doFinalize(reason)
+    return this.finalizePromise
+  }
+
+  private async doFinalize(reason: string): Promise<StopResult> {
     if (this.stopResult) return this.stopResult
+    // 收尾后不再需要延迟检查, 清掉定时器免得它拖住进程退出
+    if (this.noPageTimer) {
+      clearTimeout(this.noPageTimer)
+      this.noPageTimer = undefined
+    }
     const endedAt = Date.now()
     const reportPath = join(this.sessionDir, 'report.md')
     // 报告生成/写盘失败都不阻断收尾: stopResult 必须被设置, 否则收尾会静默丢失
