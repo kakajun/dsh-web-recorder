@@ -9,6 +9,7 @@ import {
   chromium,
   type Browser,
   type BrowserContext,
+  type CDPSession,
   type Page,
   type Request
 } from 'playwright-core'
@@ -97,6 +98,9 @@ export class RecorderSession {
   private jsonl: WriteStream
   private browser?: Browser
   private context?: BrowserContext
+  /** CDP attach 模式下为 true, 此时不主动关闭浏览器进程 */
+  private attached = false
+  private cdpSession?: CDPSession
   private pageIds = new Map<Page, number>()
   private nextPageId = 1
   private openPages = 0
@@ -114,7 +118,11 @@ export class RecorderSession {
     this.jsonl = createWriteStream(this.eventsPath, { flags: 'w' })
   }
 
-  /** 启动浏览器并完成全部监听挂载; 失败时清理已建目录流。 */
+  /**
+   * 启动浏览器并完成全部监听挂载; 失败时清理已建目录流。
+   * 优先尝试 CDP attach 到已运行的浏览器(如 Playwright 打开的页面),
+   * 失败时回退到新开浏览器窗口。
+   */
   static async start(
     startUrl: string | undefined,
     opts: RecorderOptions
@@ -125,34 +133,71 @@ export class RecorderSession {
     const dirName = `rec-${pad2(now.getHours())}-${pad2(now.getMinutes())}-${pad2(now.getSeconds())}`
     const session = new RecorderSession(opts, join(opts.outputDir, dirName))
     try {
-      session.browser = await chromium.launch({
-        headless: false,
-        ...(opts.executablePath.trim()
-          ? { executablePath: opts.executablePath.trim() }
-          : { channel: opts.channel })
-      })
-      session.context = await session.browser.newContext({ viewport: null })
-      await session.context.exposeBinding(
+      // 先尝试 CDP attach 到已有浏览器
+      const attached = await session.tryAttach()
+      if (!attached) {
+        // 回退: 新开浏览器窗口
+        session.browser = await chromium.launch({
+          headless: false,
+          ...(opts.executablePath.trim()
+            ? { executablePath: opts.executablePath.trim() }
+            : { channel: opts.channel })
+        })
+        session.context = await session.browser.newContext({ viewport: null })
+      }
+      await session.context!.exposeBinding(
         '__huafengRecordUIEvent',
         (source, payload: UiPayload) => {
           session.pushUi(source.page, payload)
         }
       )
-      await session.context.addInitScript(INIT_SCRIPT)
-      session.context.on('page', page => session.attachPage(page))
+      await session.context!.addInitScript(INIT_SCRIPT)
+      session.context!.on('page', page => session.attachPage(page))
       // 用户直接关掉浏览器时自动收尾, 已录数据不丢; stop() 主动关窗时用 stop 的真实原因
-      session.browser.on('disconnected', () => {
-        if (session.noPageTimer) clearTimeout(session.noPageTimer)
-        session.noPageTimer = undefined
-        void session.finalize(session.stoppingReason ?? 'browser-closed')
-      })
-      for (const page of session.context.pages()) session.attachPage(page)
-      const page = session.context.pages()[0] ?? (await session.context.newPage())
+      if (!session.attached) {
+        session.browser!.on('disconnected', () => {
+          if (session.noPageTimer) clearTimeout(session.noPageTimer)
+          session.noPageTimer = undefined
+          void session.finalize(session.stoppingReason ?? 'browser-closed')
+        })
+      }
+      for (const page of session.context!.pages()) session.attachPage(page)
+      const page = session.context!.pages()[0] ?? (await session.context!.newPage())
       if (startUrl?.trim()) await page.goto(startUrl.trim(), { waitUntil: 'domcontentloaded' })
       return session
     } catch (cause) {
       session.jsonl.end()
       throw cause
+    }
+  }
+
+  /** 尝试通过 CDP attach 到已运行的浏览器(如 Playwright 打开的页面)。成功返回 true。 */
+  private async tryAttach(): Promise<boolean> {
+    const cdpUrl = this.opts.cdpUrl?.trim()
+    if (!cdpUrl) return false
+    try {
+      this.browser = await chromium.connectOverCDP(cdpUrl)
+      this.attached = true
+      // connectOverCDP 返回的 browser 可能已有 context, 取第一个或新建
+      const contexts = this.browser.contexts()
+      if (contexts.length > 0) {
+        this.context = contexts[0]
+      } else {
+        this.context = await this.browser.newContext({ viewport: null })
+      }
+      // CDP attach 模式下, 通过 CDP session 监听浏览器关闭
+      this.cdpSession = await this.context.newCDPSession(this.context.pages()[0] ?? (await this.context.newPage()))
+      this.cdpSession.on('Inspector.targetCrashed', () => {
+        void this.finalize(this.stoppingReason ?? 'browser-crashed')
+      })
+      return true
+    } catch {
+      // attach 失败, 清理并返回 false 让调用方回退到 launch
+      this.browser = undefined
+      this.context = undefined
+      this.cdpSession = undefined
+      this.attached = false
+      return false
     }
   }
 
@@ -195,8 +240,14 @@ export class RecorderSession {
         Promise.allSettled([...this.pendingBodies]),
         new Promise<void>(resolve => setTimeout(resolve, 2000))
       ])
-      if (this.context) await this.context.close().catch(() => undefined)
-      if (this.browser) await this.browser.close().catch(() => undefined)
+      if (this.attached) {
+        // CDP attach 模式: 不关闭浏览器进程, 只断开 CDP 连接
+        if (this.cdpSession) await this.cdpSession.detach().catch(() => undefined)
+        if (this.browser) await this.browser.close().catch(() => undefined)
+      } else {
+        if (this.context) await this.context.close().catch(() => undefined)
+        if (this.browser) await this.browser.close().catch(() => undefined)
+      }
     } finally {
       return this.finalize(reason)
     }

@@ -65,6 +65,7 @@ const outputDir = join(here, '../reports/recorder-smoke')
 const opts = {
   channel: process.env.SMOKE_CHANNEL || 'msedge',
   executablePath: '',
+  cdpUrl: '',
   outputDir,
   captureResponseBodies: true,
   maxBodyBytes: 16384,

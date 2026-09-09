@@ -32,6 +32,7 @@ export { RecorderSession } from './session.ts'
 const RECORDER_DEFAULTS = {
   channel: 'msedge',
   executablePath: '',
+  cdpUrl: '',
   outputDir: '',
   captureResponseBodies: true,
   maxBodyBytes: 16384,
@@ -45,6 +46,8 @@ export const Config = z.object({
   channel: z.string().default(RECORDER_DEFAULTS.channel),
   // 自定义浏览器可执行文件路径, 非空时覆盖 channel
   executablePath: z.string().default(RECORDER_DEFAULTS.executablePath),
+  // CDP 调试地址(如 http://127.0.0.1:9222), 非空时优先 attach 到已有浏览器(如 Playwright 打开的页面)
+  cdpUrl: z.string().default(RECORDER_DEFAULTS.cdpUrl),
   // 录制产物输出根目录; 为空时默认当前工作目录(用户正在操作的文件夹)下 reports/recorder
   outputDir: z.string().default(RECORDER_DEFAULTS.outputDir),
   captureResponseBodies: z.boolean().default(RECORDER_DEFAULTS.captureResponseBodies),
@@ -60,6 +63,7 @@ export const Config = z.object({
 interface RecorderConfig {
   channel?: string
   executablePath?: string
+  cdpUrl?: string
   outputDir?: string
   captureResponseBodies?: boolean
   maxBodyBytes?: number
@@ -130,6 +134,7 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
   const opts = {
     channel: config?.channel ?? RECORDER_DEFAULTS.channel,
     executablePath: config?.executablePath ?? RECORDER_DEFAULTS.executablePath,
+    cdpUrl: config?.cdpUrl ?? RECORDER_DEFAULTS.cdpUrl,
     outputDir,
     captureResponseBodies: config?.captureResponseBodies ?? RECORDER_DEFAULTS.captureResponseBodies,
     maxBodyBytes: config?.maxBodyBytes ?? RECORDER_DEFAULTS.maxBodyBytes,
@@ -208,7 +213,7 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
             {
               type: 'text',
               text:
-                `录制已开始, 浏览器窗口已打开${value.initialUrl ? `并导航到 ${value.initialUrl}` : ''}。\n` +
+                `录制已开始${opts.cdpUrl ? `(CDP attach 到已有浏览器: ${opts.cdpUrl})` : ', 浏览器窗口已打开'}${value.initialUrl ? `并导航到 ${value.initialUrl}` : ''}。\n` +
                 `产物目录: ${value.sessionDir}\n` +
                 `请用户在浏览器中手动操作; 完成后调用 recorder_stop 生成报告。`
             }
@@ -240,7 +245,7 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           return toolError({
             type: 'browser',
             message: `浏览器启动失败: ${cause instanceof Error ? cause.message : String(cause)}`,
-            hint: `请确认本机安装了 ${opts.channel === 'msedge' ? 'Edge' : opts.channel} 浏览器, 或在插件 Config 中设置 executablePath/channel`
+            hint: `请确认本机安装了 ${opts.channel === 'msedge' ? 'Edge' : opts.channel} 浏览器, 或在插件 Config 中设置 executablePath/channel/cdpUrl`
           })
         }
         // 启动期间调用被取消: 不收留会话, 立即收尾释放浏览器

@@ -72,6 +72,8 @@ export interface RecorderOptions {
   channel: string
   /** 自定义浏览器可执行文件路径, 覆盖 channel */
   executablePath: string
+  /** CDP 调试地址(如 http://127.0.0.1:9222), 非空时优先 attach 到已有浏览器 */
+  cdpUrl: string
   /** 录制产物输出目录(每次录制在其下建时间戳子目录) */
   outputDir: string
   /** 是否抓取 xhr/fetch 响应体(截断到 maxBodyBytes) */

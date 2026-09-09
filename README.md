@@ -33,6 +33,63 @@
 
 两张图对照着看：一次「输入关键词并查询」的操作，在 `events.jsonl` 里留下了对应的 `POST /api/query` 请求与 `200` 响应事件，在 `report.md` 里则汇总成一行请求明细——这正是设计初衷里「页面操作一遍，留下可分析的操作依据」的直观体现。
 
+## 🚀 安装
+
+**前置**：已装好 DSH（`dsh web` 能正常运行），Node.js ≥ 18、pnpm ≥ 8。
+
+```sh
+dsh plugin --profile web add dsh-web-recorder@latest
+```
+
+装完**硬刷新浏览器**（Cmd/Ctrl+Shift+R）即可在 DSH 会话工具列表里看到 `recorder_*` 工具（DSH 对 client 改动热加载，无需重启；仅 host 半更新时需要重启）。
+
+**让 DSH 自己装**——把下面这段提示词发给任意一个 DSH 会话：
+
+```text
+帮我安装 dsh-web-recorder 插件（网页操作录制器），步骤：
+1. 执行 dsh plugin --profile web add dsh-web-recorder@latest
+2. 完成后提醒我硬刷新浏览器（Cmd/Ctrl+Shift+R）
+```
+
+<details>
+<summary><b>更新</b></summary>
+
+```sh
+dsh plugin --profile web add dsh-web-recorder@latest
+```
+
+更新完**硬刷新浏览器**（Cmd/Ctrl+Shift+R）即可生效。
+
+</details>
+
+<details>
+<summary><b>常见问题</b></summary>
+
+| 现象 | 原因与解决 |
+|---|---|
+| 报 `Ignored build scripts` | pnpm 拦截了构建脚本。在 profile 目录（`~/.dsh/profiles/web`）跑 `pnpm approve-builds --all`。 |
+| 报「找不到 profile 目录」 | 先跑一次 `dsh web`，让它初始化 `~/.dsh/profiles/web`。 |
+| 提示 `dsh: command not found` | 先安装 DSH；或直接用 `npx -y --package @deepseek-ai/dsh dsh plugin --profile web add dsh-web-recorder@latest`。 |
+
+</details>
+
+<details>
+<summary><b>从源码安装 / 开发（可选）</b></summary>
+
+调试本地改动时，把依赖指向本地克隆并自行构建：
+
+```text
+1. git clone https://github.com/kakajun/dsh-web-recorder.git ~/Code/dsh-web-recorder
+   cd ~/Code/dsh-web-recorder && pnpm install && pnpm build
+2. ~/.dsh/profiles/web/package.json 的 dependencies 写 "dsh-web-recorder": "link:<克隆目录绝对路径>"
+3. 在 ~/.dsh/profiles/web 执行 pnpm install
+4. 硬刷新浏览器（Cmd/Ctrl+Shift+R）即可生效
+```
+
+更新：`git pull && pnpm install && pnpm build` → 硬刷新浏览器即可。
+
+</details>
+
 ## 注册的工具
 
 | 工具                   | 说明                                                                    |
@@ -47,11 +104,11 @@
 
 ### 什么时候会命中（触发场景）
 
-插件的 3 个工具会随插件启用出现在 DSH 会话的工具列表里，「命中」发生在模型做工具选择时——依据是工具名与描述。当用户任务属于「查清某个网页业务流程背后调用了哪些接口、参数/响应长什么样，并据此生成接口级流程说明或 skill」时，模型应主动调用 `recorder_*`。典型任务表述：
+插件的 3 个工具会随插件启用出现在 DSH 会话的工具列表里，「命中」发生在模型做工具选择时——依据是工具名与描述。当用户任务属于「查清某个网页业务流程背后调用了哪些接口、参数/响应长什么样，并据此生成接口级流程说明或 skill」时，模型应主动调用 `recorder_*`。这类任务通常要分步完成：先打开目标页面开始录制，再由驱动方（真人或自动化工具）在页面上完成实际操作，最后基于录制结果分析沉淀。典型任务表述：
 
-- "帮我把在 XX 平台上『xxx』流程背后调用的接口和调用顺序理清楚，做成 skill，让我以后直接用接口完成"
-- "XX 页面点『查询』时发的请求是什么？参数怎么传？"
-- "我在页面上操作一遍，你录下来，然后分析生成接口对接说明"
+- "帮我打开 `http://目标地址`，开始录制"
+- "打开 XX 页面，我操作一遍，你录下来再分析接口调用"
+- "我在页面上点『查询』时发了什么请求？帮我录下来看看"
 
 如果只是回答不涉及真实页面操作的问题（例如直接查文档就能答），模型通常不会命中本插件。
 
@@ -80,13 +137,14 @@
 ### 协同前提（重要）
 
 - 录制范围是**插件自己启动的那个浏览器窗口**（含其新标签页与 iframe）；驱动方（真人或自动化工具）的操作必须发生在**这个窗口里**才会被录到。
-- 当前实现的窗口由插件自启、面向人工直接操作；若要由 playwright MCP / browser-use 等自动化工具驱动**同一个**窗口，需要驱动工具能附着到该浏览器实例（共享实例 / CDP 连接）——此能力尚未内置，见下方「已知限制」。
+- 若想让 playwright MCP / browser-use 等自动化工具驱动**同一个**浏览器实例，可在插件 Config 中设置 `cdpUrl`（如 `http://127.0.0.1:9222`），让记录仪 attach 到驱动方已启动的浏览器；此时 `recorder_stop` 只会断开 CDP 连接，不会关闭外部浏览器进程。
 
 ### 前置条件与注意
 
 - 本机需装有浏览器：默认用 Edge（`channel: msedge`），可配 `chrome` 或 `executablePath`；插件不下载浏览器
 - 至少要有一种浏览器驱动方在场：真人演示，或 playwright MCP / browser-use 等自动化工具
-- 有头窗口在录制期间可见，属预期，结束即关闭
+- 配置 `cdpUrl` 时，记录仪会优先通过 Chrome DevTools Protocol attach 到该地址对应的已有浏览器实例；attach 失败会回退到新开窗口
+- CDP attach 模式下，`recorder_stop` 不会关闭外部浏览器进程，仅断开录制连接；普通模式（未配置 `cdpUrl`）下结束会关闭插件自启的窗口
 - `events.jsonl` 含请求头/请求体/响应体等完整数据，按敏感数据处理，勿外发
 
 ## 录制内容
@@ -101,6 +159,7 @@
 | ----------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `channel`               | `msedge`                                                        | playwright-core 浏览器渠道（`msedge`/`chrome`），使用本机已装浏览器，不下载 Chromium                                     |
 | `executablePath`        | `''`                                                            | 自定义浏览器可执行文件路径，非空时覆盖 `channel`                                                                         |
+| `cdpUrl`                | `''`                                                            | CDP 调试地址（如 `http://127.0.0.1:9222`），非空时优先 attach 到已有浏览器；失败则回退到新开窗口                         |
 | `outputDir`             | `''`                                                            | 产物输出根目录；空则默认当前工作目录（用户正在操作的文件夹，harness 会话 cwd）下 `reports/recorder` |
 | `captureResponseBodies` | `true`                                                          | 是否抓取 xhr/fetch 响应体                                                                                                |
 | `maxBodyBytes`          | `16384`                                                         | 单个请求体/响应体最大记录字节数，超出截断                                                                                |
@@ -116,6 +175,7 @@ pnpm typecheck     # tsc --noEmit
 pnpm test          # vitest 单元测试(report 生成纯函数)
 pnpm build         # tsdown 产物到 lib/(插件加载与 smoke 依赖产物)
 pnpm smoke         # 真实 Edge 端到端冒烟(需本机已装浏览器, 产物在 reports/)
+pnpm smoke:cdp     # CDP attach 模式端到端冒烟(需本机已装浏览器, 产物在 reports/)
 ```
 
 ## 仓库收录清单(awesome-dsh-plugin)
