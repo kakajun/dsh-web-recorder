@@ -86,6 +86,12 @@ export interface RecorderOptions {
   requestResourceTypes: string[]
   /** 需要从请求头中抹除的头名(小写) */
   redactHeaders: string[]
+  /**
+   * 等待秒数: recorder_start 之后先等 N 秒再开始记录(这 N 秒内的事件一律丢弃, 不落盘也不计数),
+   * 用来跳过登录页 / 首页加载那批与业务流程无关的初始化请求。0 或负数表示立即开始记录。
+   * 计时自 recorder_start 调用时刻起算(浏览器启动与起始页导航都落在这段等待时间内)。
+   */
+  waitSeconds: number
 }
 
 // 用 type 别名而非 interface: 对象字面量类型带隐式索引签名, 可赋给输出 schema 推断的 Record<string, JsonValue>
@@ -113,6 +119,10 @@ export interface StopResult {
   eventsPath: string
   reportPath: string
   stats: SessionStats
+  /** 本次录制的等待秒数(0 表示立即开始记录) */
+  waitSeconds: number
+  /** 等待期内被丢弃的事件数 */
+  skippedEvents: number
 }
 
 // 用 type 别名而非 interface: 对象字面量类型带隐式索引签名, 可赋给输出 schema 推断的 Record<string, JsonValue>

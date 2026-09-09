@@ -32,7 +32,8 @@ const opts = {
   maxBodyBytes: 16384,
   recordConsole: false,
   requestResourceTypes: ['xhr', 'fetch'],
-  redactHeaders: ['authorization', 'cookie']
+  redactHeaders: ['authorization', 'cookie'],
+  waitSeconds: 0
 }
 
 let failed = 0

@@ -14,7 +14,7 @@
 
 | 工具 | 说明 |
 | --- | --- |
-| `recorder_start(url?)` | 开始录制：attach 到已有浏览器窗口（cdpUrl / 自动发现 MCP CDP 端口）或启动有头浏览器，可导航到起始 URL |
+| `recorder_start(url?, waitSeconds?)` | 开始录制：attach 到已有浏览器窗口（cdpUrl / 自动发现 MCP CDP 端口）或启动有头浏览器，可导航到起始 URL；`waitSeconds` 让录制先等 N 秒再记录（跳过登录/初始化噪音），默认 0 立即记录 |
 | `recorder_stop()` | 停止录制：生成 `report.md`；attach 模式只断开 CDP 连接，插件自启窗口才关闭；幂等 |
 | `recorder_status()` | 查询状态：是否在录制、事件计数、产物目录、上次收尾结果 |
 
@@ -43,6 +43,7 @@ pnpm build         # tsdown 产物到 lib/(插件加载与 smoke 依赖该产物
 pnpm smoke         # 真实 Edge 端到端冒烟(需本机已装浏览器, 产物在 reports/)
 pnpm smoke:cdp     # CDP attach 模式端到端冒烟(需本机已装浏览器, 产物在 reports/)
 pnpm smoke:mcp     # MCP 浏览器自动发现 attach 冒烟(模拟带调试端口的 MCP Chrome, 产物在 reports/)
+pnpm smoke:wait    # 等待期(前置剔除)冒烟: 验证 waitSeconds 等待期内不记录、等待期后正常记录
 ```
 
 注意：`pnpm smoke` / `pnpm smoke:cdp` 依赖 `lib/index.js`，**改动源码后须先 `pnpm build`** 再跑冒烟。发布前钩子 `prepublishOnly` 会自动构建。
@@ -56,6 +57,8 @@ src/
               管理单会话生命周期(session/lastResult), 插件卸载时经 ctx.effect 兜底收尾。
               Config 默认值由 RECORDER_DEFAULTS 单一来源提供(schema 与 apply 兜底共用)。
   session.ts  RecorderSession 录制会话核心: 启动浏览器(cdpUrl / 自动发现 MCP CDP 端口 /
+              等待期 waitSeconds(录制开始后先等 N 秒再记录, 等待期内事件整组丢弃: request 不登记
+              requestId 故其响应/失败一并忽略; 计时自 startedAt 起算, 覆盖浏览器启动与起始页导航) /
               channel / executablePath, attach 优先、失败回退接管或新开)、注入 INIT_SCRIPT(捕获阶段
               监听 click/change/submit, 经 exposeBinding 回传 UI 事件; attach 模式对已加载页面
               直接 evaluate 补装)、监听 request/response/requestfailed/console 事件, 事件内存留存
@@ -99,6 +102,7 @@ assets/           README 截图与封面
 - `RecorderSession.stop()` / `finalize()` 必须幂等：用户关浏览器、插件卸载、`recorder_stop` 三条路径会并发触发收尾，`stopResult` 只允许设置一次；报告生成/写盘失败不得阻断收尾。
 - 页面/请求映射（`pageIds` / `requestIds`）用 `WeakMap`：不持强引用，长时间录制不会把已关闭的页面与已完成请求堆积在内存；请求失败（终态）时主动 `delete`。
 - 事件计数只走 `src/stats.ts`：会话侧 `push` 时增量累加，报告侧 `countEvents` 一次性统计，两处不得各写一份 `switch`。
+- 等待期（前置剔除）只有 `waitSeconds` 一个入参（工具调用时传，默认 0），不进 Config；丢弃逻辑集中在 `RecorderSession.waiting()` 与各事件入口的早退分支，等待期内被丢的事件只累计 `skipped` 供回显。
 - 启动中途失败要释放已建的浏览器与事件流；attach 失败同样要断开已建立的连接（`start` / `tryAttach` 的 catch 里处理）。
 - 保留 `console.log` 等调试输出，仅在明确要求时删除。
 - Node 版本由 fnm 管理（`D:\fnm\node-versions`，`fnm list` 查看）。
@@ -107,7 +111,7 @@ assets/           README 截图与封面
 ## 测试策略
 
 - **单元测试**（`pnpm test`）：vitest，直接运行 TS 源码无需构建。覆盖 `report.ts` 的 `generateMarkdown` 纯函数（`tests/report.test.ts`）与 `stats.ts` 的计数口径（`tests/stats.test.ts`）。
-- **端到端冒烟**（`pnpm smoke` / `pnpm smoke:cdp` / `pnpm smoke:mcp`）：非测试框架的手工脚本，需要本机安装 Edge（或 Chrome）。三者分别覆盖新开窗口录制、显式 cdpUrl attach、MCP 浏览器 CDP 端口自动发现 attach；`smoke:cdp`/`smoke:mcp` 还断言 `stop` 后外部浏览器进程不被关闭。断言 `events.jsonl` 与 `report.md` 内容（点击/输入/请求/响应/脱敏）。
+- **端到端冒烟**（`pnpm smoke` / `pnpm smoke:cdp` / `pnpm smoke:mcp` / `pnpm smoke:wait`）：非测试框架的手工脚本，需要本机安装 Edge（或 Chrome）。前三者分别覆盖新开窗口录制、显式 cdpUrl attach、MCP 浏览器 CDP 端口自动发现 attach，`smoke:wait` 覆盖等待期（等待期内不记录、等待期后正常记录）；`smoke:cdp`/`smoke:mcp` 还断言 `stop` 后外部浏览器进程不被关闭。断言 `events.jsonl` 与 `report.md` 内容（点击/输入/请求/响应/脱敏）。
 - 修改 `session.ts` 事件采集逻辑后，应跑 `pnpm build && pnpm smoke`（CDP 相关改动另跑 `pnpm smoke:cdp`）验证；修改 `report.ts` 至少跑 `pnpm test` + `pnpm typecheck`。
 
 ## 安全注意事项

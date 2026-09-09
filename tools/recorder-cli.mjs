@@ -27,7 +27,9 @@ const opts = {
   maxBodyBytes: 16384,
   recordConsole: false,
   requestResourceTypes: ['xhr', 'fetch'],
-  redactHeaders: ['cookie', 'authorization', 'proxy-authorization', 'x-api-key', 'set-cookie']
+  redactHeaders: ['cookie', 'authorization', 'proxy-authorization', 'x-api-key', 'set-cookie'],
+  // 等待 N 秒再开始记录(等价剔除开头这段时间), 可用环境变量 RECORDER_WAIT_SECONDS 预设
+  waitSeconds: Number(process.env.RECORDER_WAIT_SECONDS) || 0
 }
 
 let session

@@ -2,7 +2,7 @@
 
 **Languages: English · [简体中文](README.md)**
 
-A browser-operation recorder plugin for DSH. It targets the scenario where a human drives the browser while the plugin records in the background: a headed browser window is launched (the local Edge by default); as you interact with pages normally, the plugin records every click / input / form submission and every network request / response / failure, then generates a Markdown summary report when recording stops.
+A browser-operation recorder plugin for DSH. It targets the scenario where a human drives the browser while the plugin records in the background: it can attach to an already-open browser window (e.g. a Playwright MCP browser with a debugging port — **this is optional**), or launch its own headed browser window (the local Edge by default); as you interact with pages normally, the plugin records every click / input / form submission and every network request / response / failure, then generates a Markdown summary report when recording stops.
 
 ## Why this plugin exists (design intent)
 
@@ -37,8 +37,8 @@ Reading the two side by side: a single “enter keyword and query” action show
 
 | Tool                   | Description                                                                              |
 | ---------------------- | ---------------------------------------------------------------------------------------- |
-| `recorder_start(url?)` | Starts recording: launches a headed browser, optionally navigating to the starting URL; events are written to `events.jsonl` in real time |
-| `recorder_stop()`      | Stops recording: generates the `report.md` summary and closes the browser; idempotent     |
+| `recorder_start(url?, waitSeconds?)` | Starts recording: attaches to an existing browser window when possible (`cdpUrl`, or an auto-discovered Playwright MCP browser with a debugging port), otherwise launches a headed browser; optionally navigates to the starting URL; `waitSeconds` waits N seconds before anything is recorded (skips login / initialization noise). Events are written to `events.jsonl` in real time |
+| `recorder_stop()`      | Stops recording: generates the `report.md` summary; in attach mode it only disconnects CDP (only plugin-launched windows are closed); idempotent |
 | `recorder_status()`    | Reports status: whether recording is active, per-type event counts, output directory, and the result of the last wrap-up |
 
 If the user closes the browser window directly, the session is finalized automatically (`reason: browser-closed`) and the recorded data is kept.
@@ -63,16 +63,18 @@ This repository is itself a DSH plugin: the entry is `lib/index.js` (source `src
 
 The plugin **does not operate pages itself** — it exposes only `recorder_start` / `recorder_stop` / `recorder_status`, and its job is to “watch and record”: it launches a monitored headed browser window and logs, as raw events, every UI operation and network request happening inside it. Actually “opening page XXXX and performing the steps” is done by a **browser driver**, which can be:
 
-1. **A human**: clicking / typing / navigating manually in the window the plugin popped up;
-2. **playwright MCP**: the model uses it to open pages, click, fill forms, and execute the target flow step by step;
-3. **Other browser-use style tools**: likewise acting as the “hands” that drive the browser through the flow.
+1. **A human** (no extra tooling required): clicking / typing / navigating manually in the window the plugin popped up;
+2. **playwright MCP** (optional): the model uses it to open pages, click, fill forms, and execute the target flow step by step;
+3. **Other browser-use style tools** (optional): likewise acting as the “hands” that drive the browser through the flow.
+
+**playwright MCP is not a required dependency**: the plugin works perfectly without it — a human walking through the flow in the popped-up window is enough, and it is the most common setup. MCP / browser-use only automate “opening pages + performing the steps”; they are optional extras.
 
 The model (agent) orchestrates the session: arm the recorder first, direct the driver to run the flow, then wrap up and read the artifacts.
 
-### Recommended flow with playwright MCP / browser-use (open page X → record the steps)
+### Recommended flow: open page X → record the steps (works with or without playwright MCP)
 
-1. **(Optional) driver opens the page first**: let playwright MCP open the target page; as long as the MCP browser was started with `--remote-debugging-port` (see “Collaboration prerequisite” below), `recorder_start` auto-discovers its CDP port and **attaches to that already-open window** — no new browser is launched
-2. **Arm the recorder**: `recorder_start()` — attaches to the existing window, or pops up the monitored browser and opens the start page; from this moment every operation and network request in the window is streamed to `events.jsonl`
+1. **(Optional, recommended when MCP is available) the driver opens the page first**: let playwright MCP open the target page; as long as the MCP browser was started with `--remote-debugging-port` (see “Collaboration prerequisite” below), `recorder_start` auto-discovers its CDP port and **attaches to that already-open window** — no new browser is launched, and the MCP can keep driving that same window. **Without playwright MCP, skip this step** and go straight to step 2: a human operates the window the plugin pops up
+2. **Arm the recorder**: `recorder_start()` — attaches to the existing window, or pops up the monitored browser and opens the start page; from this moment every operation and network request in the window is streamed to `events.jsonl` (note: page loads happening after this point are recorded too — see “Initialization-request noise” below)
 3. **Driver runs the flow**: let playwright MCP / browser-use (or a human) execute the whole target flow **inside the same monitored window** — opening pages, filling forms, clicking submit, going to the next page… both the UI events of each step and the API calls they trigger are captured
 4. **(Optional) check progress**: `recorder_status()` — whether recording, per-type event counts, artifact directory
 5. **Wrap up**: `recorder_stop()` — generates the `report.md` summary (in attach mode it only disconnects the CDP session and leaves the external browser running; plugin-launched windows are closed; closing the window manually also finalizes the session)
@@ -80,6 +82,8 @@ The model (agent) orchestrates the session: arm the recorder first, direct the d
 
 ### Collaboration prerequisite (important)
 
+- **playwright MCP is optional, not a prerequisite**: the plugin records fine without it (and without browser-use) — a human performing the flow in the popped-up window is enough, and that is the most common setup. MCP / browser-use only automate “opening pages + performing the steps”.
+- **The one case where you cannot keep working in the browser playwright MCP already opened**: the MCP browser was started **without** `--remote-debugging-port`. The recorder then cannot attach and falls back to takeover: it notes the MCP browser's current URL, **kills the MCP browser process**, and re-opens the same page in a plugin-launched window. After that the MCP has lost its browser and can no longer drive it (if the MCP later opens a fresh window, that window is outside the recording scope too). To let the MCP and the recorder coexist — so the MCP can keep operating the very window being recorded — give the MCP browser a debugging port (or point `cdpUrl` at it explicitly).
 - Recording covers **the browser window the plugin attached to / started** (including its new tabs / iframes); operations by any driver (human or automation) are only captured when they happen **inside this window**.
 - **Sharing one browser window with playwright MCP**: start the MCP browser with a remote debugging port and the recorder attaches automatically. Pass a config file to `@playwright/mcp` (`--config=path/to/playwright-mcp.config.json`) containing:
   ```json
@@ -97,9 +101,46 @@ The model (agent) orchestrates the session: arm the recorder first, direct the d
 ### Prerequisites and caveats
 
 - A browser must be installed locally: Edge by default (`channel: msedge`); `chrome` or a custom `executablePath` are configurable. The plugin never downloads a browser
-- At least one browser driver must be present: a human demo, or an automation tool such as playwright MCP / browser-use
+- **playwright MCP is not mandatory**: the driver can be a human (operating the window the plugin popped up) or an automation tool such as playwright MCP / browser-use; with neither installed, the plugin simply opens its own window for a human to use
 - The headed window is visible during recording by design, and closes when done
 - `events.jsonl` contains full request/response data (headers/bodies); treat it as sensitive and do not share it
+
+### Initialization-request noise: opening the page directly records extra requests (verified)
+
+Recording starts the moment `recorder_start` runs, and **any page load that happens after that point falls inside the recording scope**. So when `recorder_start(url)` opens the page directly (or a driver navigates after recording has begun), the page's own initialization requests are captured in full — session/auth checks, dictionaries, menus, config, user info, analytics beacons, and so on.
+
+Measured on a local page that fires two initialization requests on load (`/api/init`, `/api/config`) and the business request `/api/query` only on button click:
+
+| Approach | Initialization requests recorded | Business requests recorded |
+| --- | --- | --- |
+| `recorder_start(url)` opens the page directly | 2 (`/api/init` + `/api/config`) | also captured once clicked |
+| Page loaded first, then attach and record | 0 | 1 (`/api/query`) |
+
+The difference comes purely from whether the page load happened before or after recording started.
+
+**Impact**: those initialization requests are usually irrelevant to the target business flow and dilute the signal — when answering “what request does the *Query* button send?”, you must first separate page-inherent requests from action-triggered ones.
+
+**How to reduce the noise**:
+
+1. **Prefer attach mode**: have the driver (playwright MCP started with `--remote-debugging-port`, or an explicit `cdpUrl`) open the target page and wait until it settles, then call `recorder_start()` **with no url** — recording begins with the page already ready, so initialization requests are not included.
+2. **When login / redirects are required**: pass `waitSeconds` at start (see the next section) so the plugin waits N seconds before recording anything; if already recorded, trim the leading load section by time.
+3. **Filter afterwards**: in `events.jsonl`, requests that immediately follow a `navigate` event and have no matching UI event (click / change / submit) are almost always initialization noise.
+4. **Take a baseline**: call `recorder_status()` right before the operation and note `eventCount`; afterwards only look at events whose `seq` is greater than that baseline.
+5. **Analyze against the operation timeline**: `report.md` interleaves UI events and requests by time — the requests that line up with a click / input are the real business-flow APIs.
+
+### Wait period: `waitSeconds` on `recorder_start` (skip login / initialization up front)
+
+When the target site requires a login, or the landing page fires a burst of initialization requests, there is no need to trim afterwards — just tell the plugin to wait a bit before recording:
+
+```text
+recorder_start({ url: "https://target/login", waitSeconds: 10 })
+```
+
+- **One single meaning**: after recording starts, **wait 10 seconds before recording anything**, which is exactly “drop the first 10 seconds from the result”. Clicks / inputs / navigations / requests during the wait are never written to disk; recording begins normally once the wait is over.
+- **Timing baseline**: the moment `recorder_start` is called. Browser launch and the start-page navigation are inside that window, so the whole “login → redirect to home → home initialization” sequence is skipped.
+- **Whole groups are dropped**: if a request is issued during the wait, its response / failure is dropped too, so you never end up with a half record (response without request).
+- **Observable**: `recorder_status()` reports `waitRemainingSec` (how much longer until recording actually starts — while > 0, actions are not recorded) and `skippedEvents` (events dropped during the wait); the `recorder_stop()` result and the `report.md` header also state “waited 10s before recording: N events dropped during the wait”.
+- **Omitted or 0 = start recording immediately** (default, same as the old behaviour).
 
 ## What gets recorded
 
@@ -130,6 +171,7 @@ pnpm test          # vitest unit tests (pure functions for report generation)
 pnpm build         # tsdown output to lib/ (required by plugin loading and the smoke test)
 pnpm smoke         # real-Edge end-to-end smoke test (needs a browser installed locally; artifacts under reports/)
 pnpm smoke:mcp     # MCP auto-discovery attach smoke test (simulates an MCP Chrome with a debugging port)
+pnpm smoke:wait    # wait-period smoke test: nothing is recorded during waitSeconds, recording resumes after it
 ```
 
 ## awesome-dsh-plugin compliance checklist
@@ -149,7 +191,9 @@ If you are submitting an entry to awesome-dsh-plugin:
 
 ## Known limitations
 
-- Records only the browser window the plugin attached to / started (including its new tabs / iframes); operations in any other browser instance are not captured. For automation-driven recording, the driver must share the same browser instance: when the MCP browser runs with `--remote-debugging-port` the recorder auto-attaches over CDP (see “Collaboration prerequisite”); an MCP browser without a debugging port can only be handled by the takeover fallback (close old window, open a new one).
+- Records only the browser window the plugin attached to / started (including its new tabs / iframes); operations in any other browser instance are not captured. For automation-driven recording, the driver must share the same browser instance: when the MCP browser runs with `--remote-debugging-port` the recorder auto-attaches over CDP (see “Collaboration prerequisite”); an MCP browser without a debugging port can only be handled by the takeover fallback (the MCP browser is closed and a plugin window is opened instead, after which the MCP can no longer drive that window).
+- Neither playwright MCP nor browser-use is a required dependency (a human operator is enough), but in takeover mode the MCP browser is killed, so from then on only a human can continue in the plugin-launched window.
+- In plugin-launched-window mode the start page inevitably loads after recording has begun, so a batch of initialization requests (auth / dictionaries / config / analytics …) is always recorded along with it — see “Initialization-request noise”; only attaching to an already-loaded page avoids it.
 - Sensitive request headers are redacted by default; request / response bodies get no content-level redaction (they may contain business data such as tokens), so treat `events.jsonl` as sensitive data and do not share it.
 - UI events in cross-origin iframes rely on init-script injection; pages with very strict CSP may block the injection (network events are unaffected).
 - When a click fires an API request and the page navigates away immediately, the browser cancels the response-body capture; the response body may then be missing for that request (the event itself is still recorded, just without a body).

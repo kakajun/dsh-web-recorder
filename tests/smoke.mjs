@@ -71,7 +71,8 @@ const opts = {
   maxBodyBytes: 16384,
   recordConsole: true,
   requestResourceTypes: ['xhr', 'fetch'],
-  redactHeaders: ['authorization', 'cookie']
+  redactHeaders: ['authorization', 'cookie'],
+  waitSeconds: 0
 }
 
 let session

@@ -49,6 +49,15 @@ export class RecorderSession {
   private noPageTimer?: ReturnType<typeof setTimeout>
   private requestIds = new WeakMap<Request, number>()
   private pendingBodies = new Set<Promise<void>>()
+  /**
+   * 等待期结束的时间戳(绝对 ms), 0 表示立即开始记录。
+   * 自 startedAt 起算(浏览器启动与起始页导航都在这段时间内, 正是要跳过的部分)。
+   */
+  private readonly waitUntil: number
+  /** 生效的等待秒数(入参非法时归 0) */
+  private readonly waitSeconds: number
+  /** 等待期内被丢弃的事件数(只做统计: 这些事件既不落盘也不进内存事件数组) */
+  private skipped = 0
   private stoppingReason?: string
   private stopResult?: StopResult
   /** 收尾的进行中 promise: stop / 关窗口 / 插件卸载可能并发触发, 只执行一次 */
@@ -60,6 +69,15 @@ export class RecorderSession {
     this.eventsPath = join(sessionDir, 'events.jsonl')
     mkdirSync(sessionDir, { recursive: true })
     this.jsonl = createWriteStream(this.eventsPath, { flags: 'w' })
+    // 等待期: waitSeconds 非法(非数字/负数)时按 0 处理, 避免 NaN 比较导致行为不确定
+    const seconds = Number(opts.waitSeconds)
+    this.waitSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : 0
+    this.waitUntil = this.waitSeconds > 0 ? this.startedAt + this.waitSeconds * 1000 : 0
+  }
+
+  /** 是否还在等待期内(等待期内的事件不记录)。 */
+  private waiting(): boolean {
+    return this.waitUntil > 0 && Date.now() < this.waitUntil
   }
 
   /**
@@ -197,13 +215,22 @@ export class RecorderSession {
     sessionDir: string
     counts: SessionStats
     eventCount: number
+    waitSeconds: number
+    waitRemainingSec: number
+    skippedEvents: number
   } {
     return {
       recording: !this.stopResult,
       startedAt: this.startedAt,
       sessionDir: this.sessionDir,
       counts: this.stats(),
-      eventCount: this.events.length
+      eventCount: this.events.length,
+      waitSeconds: this.waitSeconds,
+      // 等待期剩余秒数(保留 1 位): 让调用方知道「还要等多久才开始记录」
+      waitRemainingSec: this.waitUntil
+        ? Math.max(0, Math.round((this.waitUntil - Date.now()) / 100) / 10)
+        : 0,
+      skippedEvents: this.skipped
     }
   }
 
@@ -252,6 +279,12 @@ export class RecorderSession {
     page.on('request', request => {
       // 只录指定 resourceType(默认 xhr/fetch); 不录的请求不进 requestIds, 其响应/失败事件随之丢弃
       if (!this.opts.requestResourceTypes.includes(request.resourceType())) return
+      // 等待期内的请求在此直接 return: 不登记 requestId, 其响应/失败事件随之被忽略,
+      // 不会出现「请求被丢、响应被留」的半个三元组(登录/初始化接口正是要整组丢掉的)
+      if (this.waiting()) {
+        this.skipped++
+        return
+      }
       const requestId = ++this.requestSeq
       this.requestIds.set(request, requestId)
       const headers: Record<string, string> = {}
@@ -385,7 +418,13 @@ export class RecorderSession {
 
   private push(event: UnstampedEvent): void {
     if (this.stopResult) return
-    const full = { ...event, seq: ++this.seq, ts: Date.now() } as RecordedEvent
+    const ts = Date.now()
+    // 等待期: 登录/页面初始化那批事件直接丢弃, 不落盘也不计数(只累计 skipped 供回显)
+    if (ts < this.waitUntil) {
+      this.skipped++
+      return
+    }
+    const full = { ...event, seq: ++this.seq, ts } as RecordedEvent
     this.events.push(full)
     accumulateEvent(this.counts, full.type)
     this.jsonl.write(JSON.stringify(full) + '\n')
@@ -421,7 +460,9 @@ export class RecorderSession {
         startedAt: this.startedAt,
         endedAt,
         reason,
-        sessionDir: this.sessionDir
+        sessionDir: this.sessionDir,
+        waitSeconds: this.waitSeconds,
+        skippedEvents: this.skipped
       })
     } catch {
       report = `# 报告生成失败\n\n- 结束原因: ${reason}\n- 已记录事件: ${this.events.length} 个\n- 明细见 events.jsonl\n`
@@ -440,7 +481,9 @@ export class RecorderSession {
       sessionDir: this.sessionDir,
       eventsPath: this.eventsPath,
       reportPath,
-      stats: this.stats()
+      stats: this.stats(),
+      waitSeconds: this.waitSeconds,
+      skippedEvents: this.skipped
     }
     return this.stopResult
   }

@@ -39,7 +39,8 @@ const RECORDER_DEFAULTS = {
   maxBodyBytes: 16384,
   recordConsole: false,
   requestResourceTypes: 'xhr,fetch',
-  redactHeaders: 'cookie,authorization,proxy-authorization,x-api-key,set-cookie'
+  redactHeaders: 'cookie,authorization,proxy-authorization,x-api-key,set-cookie',
+  waitSeconds: 0
 } as const
 
 export const Config = z.object({
@@ -105,6 +106,7 @@ type StartSuccess = {
   startedAt: number
   attached: boolean
   initialUrl?: string
+  waitSeconds?: number
   hint: string
 }
 
@@ -118,6 +120,8 @@ type StopSuccess = {
   eventsPath: string
   reportPath: string
   stats: SessionStats
+  waitSeconds: number
+  skippedEvents: number
 }
 
 type StopResultOut = StopSuccess | { ok: false; error: ToolError }
@@ -129,6 +133,9 @@ type StatusSuccess = {
   sessionDir?: string
   eventCount?: number
   counts?: SessionStats
+  waitSeconds?: number
+  waitRemainingSec?: number
+  skippedEvents?: number
   lastResult?: JsonValue
 }
 
@@ -149,7 +156,9 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
     redactHeaders: (config?.redactHeaders ?? RECORDER_DEFAULTS.redactHeaders)
       .split(',')
       .map(h => h.trim().toLowerCase())
-      .filter(Boolean)
+      .filter(Boolean),
+    // 等待期默认 0; 每次 recorder_start 可用入参 waitSeconds 覆盖(见下方工具定义)
+    waitSeconds: RECORDER_DEFAULTS.waitSeconds
   }
 
   let session: RecorderSession | null = null
@@ -182,9 +191,17 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
         '开始网页操作录制: 若检测到正在运行的 Playwright MCP 浏览器(带 CDP 端口)或配置了 cdpUrl, ' +
         '则 attach 到该已有窗口继续录制; 否则启动一个新的有头浏览器窗口(默认本机 Edge), 用户在其中手动操作网页;' +
         '插件在后台记录每次点击/输入/表单提交和每个网络请求/响应/失败, 实时落盘 events.jsonl。' +
+        '入参 waitSeconds 可让录制先等待若干秒再开始记录(等价剔除开头这段时间), 用于跳过登录页 / ' +
+        '页面初始化那批与业务流程无关的请求。' +
         '用 recorder_stop 结束并生成 report.md 报告; 用户直接关掉浏览器窗口也会自动收尾。',
       parameters: {
-        url: { type: 'string', description: '起始 URL, 留空则打开空白页' }
+        url: { type: 'string', description: '起始 URL, 留空则打开空白页' },
+        waitSeconds: {
+          type: 'number',
+          description:
+            '等待多少秒再开始记录(默认 0 立即开始)。等待期内发生的点击/输入/请求一律不记录, ' +
+            '等价于把开头这段时间从录制结果里剔除; 需要登录或等页面初始化完成时使用, 例如 10 表示等 10 秒。'
+        }
       },
       output: {
         schema: {
@@ -196,6 +213,10 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
             startedAt: { type: 'number', description: '开始时间戳(ms)' },
             attached: { type: 'boolean', description: '是否 attach 到已有浏览器窗口(而非新开窗口)' },
             initialUrl: { type: 'string', description: '起始 URL' },
+            waitSeconds: {
+              type: 'number',
+              description: '等待多少秒后开始记录(0 表示立即开始); 等待期内的事件不记录'
+            },
             hint: { type: 'string', description: '给模型的下一步指引' },
             error: {
               type: 'object',
@@ -220,6 +241,9 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
               text:
                 `录制已开始${value.attached ? `(已 attach 到正在运行的浏览器窗口${opts.cdpUrl ? `: ${opts.cdpUrl}` : ''})` : ', 新的浏览器窗口已打开'}${value.initialUrl ? `并导航到 ${value.initialUrl}` : ''}。\n` +
                 `产物目录: ${value.sessionDir}\n` +
+                (value.waitSeconds && value.waitSeconds > 0
+                  ? `前 ${value.waitSeconds}s 为等待期(期间的操作与请求不记录), 请在这段时间内完成登录 / 等页面加载完成。\n`
+                  : '') +
                 `请用户在浏览器中手动操作; 完成后调用 recorder_stop 生成报告。`
             }
           ]
@@ -235,6 +259,9 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           })
         }
         const url = typeof args.url === 'string' && args.url.trim() ? args.url.trim() : undefined
+        // waitSeconds: 等待 N 秒再开始记录(等价剔除开头这段时间); 非法值(非数字/负数)按 0 处理
+        const rawWait = Number(args.waitSeconds)
+        const waitSeconds = Number.isFinite(rawWait) && rawWait > 0 ? rawWait : 0
         // 尊重 exec.signal: 调用已被取消时不再启动浏览器
         if (exec.signal.aborted) {
           return toolError({
@@ -245,7 +272,7 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
         }
         let started: RecorderSession
         try {
-          started = await RecorderSession.start(url, opts)
+          started = await RecorderSession.start(url, { ...opts, waitSeconds })
         } catch (cause) {
           return toolError({
             type: 'browser',
@@ -269,7 +296,11 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           startedAt: session.startedAt,
           attached: session.isAttached(),
           ...(url ? { initialUrl: url } : {}),
-          hint: '用户操作完成后调用 recorder_stop 停止并生成报告'
+          ...(waitSeconds > 0 ? { waitSeconds } : {}),
+          hint:
+            waitSeconds > 0
+              ? `等待 ${waitSeconds}s 后开始记录, 请在这段时间内完成登录 / 等页面加载完成; 之后用户操作会被记录, 完成后调用 recorder_stop 生成报告`
+              : '用户操作完成后调用 recorder_stop 停止并生成报告'
         }
       }
     })
@@ -294,6 +325,8 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
             eventsPath: { type: 'string', description: 'events.jsonl 路径' },
             reportPath: { type: 'string', description: 'report.md 路径' },
             stats: { type: 'object', additionalProperties: true, description: '分类计数' },
+            waitSeconds: { type: 'number', description: '本次录制的等待秒数(0 表示立即开始记录)' },
+            skippedEvents: { type: 'number', description: '等待期内被丢弃的事件数' },
             error: {
               type: 'object',
               additionalProperties: true,
@@ -318,7 +351,10 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
                 `录制已停止(${value.durationSec.toFixed(1)}s, ${value.eventCount} 个事件)。\n` +
                 `报告: ${value.reportPath}\n` +
                 `明细: ${value.eventsPath}\n` +
-                `点击 ${value.stats.clicks} 次, 输入 ${value.stats.changes} 次, 请求 ${value.stats.requests} 个(失败 ${value.stats.failed})。`
+                `点击 ${value.stats.clicks} 次, 输入 ${value.stats.changes} 次, 请求 ${value.stats.requests} 个(失败 ${value.stats.failed})。` +
+                (value.waitSeconds > 0
+                  ? `\n等待期 ${value.waitSeconds}s 内的 ${value.skippedEvents} 个事件已按设置丢弃(未记录)。`
+                  : '')
             }
           ]
         }
@@ -336,7 +372,9 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           eventCount: result.eventCount,
           eventsPath: result.eventsPath,
           reportPath: result.reportPath,
-          stats: result.stats
+          stats: result.stats,
+          waitSeconds: result.waitSeconds,
+          skippedEvents: result.skippedEvents
         }
       }
     })
@@ -363,6 +401,9 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
               additionalProperties: true,
               description: '分类计数(录制中时存在)'
             },
+            waitSeconds: { type: 'number', description: '本次录制的等待秒数(0 表示立即开始记录)' },
+            waitRemainingSec: { type: 'number', description: '等待期剩余秒数(已开始记录时为 0)' },
+            skippedEvents: { type: 'number', description: '等待期内已丢弃的事件数' },
             lastResult: { type: 'json', description: '上一次录制的收尾结果' }
           }
         },
@@ -375,6 +416,9 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
                 text:
                   `录制中: 已记录 ${value.eventCount} 个事件` +
                   `(点击 ${c.clicks}, 输入 ${c.changes}, 请求 ${c.requests}, 失败 ${c.failed})。\n` +
+                  (value.waitRemainingSec && value.waitRemainingSec > 0
+                    ? `仍在等待期(共 ${value.waitSeconds}s, 还剩 ${value.waitRemainingSec}s), 此期间操作不记录。\n`
+                    : '') +
                   `产物目录: ${value.sessionDir}`
               }
             ]
@@ -403,7 +447,10 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           startedAt: s.startedAt,
           sessionDir: s.sessionDir,
           eventCount: s.eventCount,
-          counts: s.counts
+          counts: s.counts,
+          waitSeconds: s.waitSeconds,
+          waitRemainingSec: s.waitRemainingSec,
+          skippedEvents: s.skippedEvents
         }
       }
     })

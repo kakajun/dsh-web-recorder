@@ -10,6 +10,10 @@ interface ReportMeta {
   endedAt: number
   reason: string
   sessionDir: string
+  /** 等待秒数(0 表示立即开始记录) */
+  waitSeconds?: number
+  /** 等待期内被丢弃的事件数 */
+  skippedEvents?: number
 }
 
 const MAX_URL = 100
@@ -46,6 +50,11 @@ export function generateMarkdown(events: RecordedEvent[], meta: ReportMeta): str
   lines.push(`- 开始时间: ${fmtTime(meta.startedAt)}`)
   lines.push(`- 结束时间: ${fmtTime(meta.endedAt)}(持续 ${durationSec}s, 结束原因: ${meta.reason})`)
   lines.push(`- 事件总数: ${events.length}`)
+  if (meta.waitSeconds && meta.waitSeconds > 0) {
+    lines.push(
+      `- 等待 ${meta.waitSeconds}s 后开始记录: 等待期内 ${meta.skippedEvents ?? 0} 个事件已丢弃(用于跳过登录 / 页面初始化的噪音请求)`
+    )
+  }
   lines.push(`- 数据目录: ${meta.sessionDir}`)
   lines.push('')
 
