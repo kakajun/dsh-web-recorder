@@ -2,7 +2,8 @@
  * dsh-web-recorder 插件: 网页操作录制器。
  *
  * 面向「用户手动操作浏览器, 插件在后台录制」的场景:
- *   recorder_start(url?) —— 启动有头浏览器(默认本机 Edge), 用户在其中手动操作;
+ *   recorder_start(url?) —— 优先 CDP attach 到正在运行的浏览器窗口(显式 cdpUrl 或自动发现
+ *     带 CDP 端口的 Playwright MCP 浏览器), 否则启动有头浏览器(默认本机 Edge), 用户在其中手动操作;
  *     插件监听每次点击/输入/表单提交(init script + exposeBinding)和每个网络请求/响应/失败,
  *     事件实时落盘 events.jsonl(防崩溃丢失)
  *   recorder_stop()      —— 停止录制, 生成 report.md 摘要报告, 关闭浏览器;
@@ -46,7 +47,8 @@ export const Config = z.object({
   channel: z.string().default(RECORDER_DEFAULTS.channel),
   // 自定义浏览器可执行文件路径, 非空时覆盖 channel
   executablePath: z.string().default(RECORDER_DEFAULTS.executablePath),
-  // CDP 调试地址(如 http://127.0.0.1:9222), 非空时优先 attach 到已有浏览器(如 Playwright 打开的页面)
+  // CDP 调试地址(如 http://127.0.0.1:9222), 非空时优先 attach 到已有浏览器;
+  // 留空也会自动发现带 CDP 端口的 Playwright MCP 浏览器并 attach
   cdpUrl: z.string().default(RECORDER_DEFAULTS.cdpUrl),
   // 录制产物输出根目录; 为空时默认当前工作目录(用户正在操作的文件夹)下 reports/recorder
   outputDir: z.string().default(RECORDER_DEFAULTS.outputDir),
@@ -101,6 +103,7 @@ type StartSuccess = {
   ok: true
   sessionDir: string
   startedAt: number
+  attached: boolean
   initialUrl?: string
   hint: string
 }
@@ -176,7 +179,8 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
     defineTool({
       name: 'recorder_start',
       description:
-        '开始网页操作录制: 启动一个有头浏览器窗口(默认本机 Edge), 用户在其中手动操作网页;' +
+        '开始网页操作录制: 若检测到正在运行的 Playwright MCP 浏览器(带 CDP 端口)或配置了 cdpUrl, ' +
+        '则 attach 到该已有窗口继续录制; 否则启动一个新的有头浏览器窗口(默认本机 Edge), 用户在其中手动操作网页;' +
         '插件在后台记录每次点击/输入/表单提交和每个网络请求/响应/失败, 实时落盘 events.jsonl。' +
         '用 recorder_stop 结束并生成 report.md 报告; 用户直接关掉浏览器窗口也会自动收尾。',
       parameters: {
@@ -190,6 +194,7 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
             ok: { type: 'boolean', required: true, description: '是否成功开始' },
             sessionDir: { type: 'string', description: '本次录制产物目录' },
             startedAt: { type: 'number', description: '开始时间戳(ms)' },
+            attached: { type: 'boolean', description: '是否 attach 到已有浏览器窗口(而非新开窗口)' },
             initialUrl: { type: 'string', description: '起始 URL' },
             hint: { type: 'string', description: '给模型的下一步指引' },
             error: {
@@ -213,7 +218,7 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
             {
               type: 'text',
               text:
-                `录制已开始${opts.cdpUrl ? `(CDP attach 到已有浏览器: ${opts.cdpUrl})` : ', 浏览器窗口已打开'}${value.initialUrl ? `并导航到 ${value.initialUrl}` : ''}。\n` +
+                `录制已开始${value.attached ? `(已 attach 到正在运行的浏览器窗口${opts.cdpUrl ? `: ${opts.cdpUrl}` : ''})` : ', 新的浏览器窗口已打开'}${value.initialUrl ? `并导航到 ${value.initialUrl}` : ''}。\n` +
                 `产物目录: ${value.sessionDir}\n` +
                 `请用户在浏览器中手动操作; 完成后调用 recorder_stop 生成报告。`
             }
@@ -262,6 +267,7 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           ok: true,
           sessionDir: session.sessionDir,
           startedAt: session.startedAt,
+          attached: session.isAttached(),
           ...(url ? { initialUrl: url } : {}),
           hint: '用户操作完成后调用 recorder_stop 停止并生成报告'
         }

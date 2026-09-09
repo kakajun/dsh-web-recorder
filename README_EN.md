@@ -71,16 +71,28 @@ The model (agent) orchestrates the session: arm the recorder first, direct the d
 
 ### Recommended flow with playwright MCP / browser-use (open page X → record the steps)
 
-1. **Arm the recorder**: `recorder_start("http://target-page")` — pops up the monitored browser and opens the start page; from this moment every operation and network request in the window is streamed to `events.jsonl`
-2. **Driver runs the flow**: let playwright MCP / browser-use (or a human) execute the whole target flow **inside the same monitored window** — opening pages, filling forms, clicking submit, going to the next page… both the UI events of each step and the API calls they trigger are captured
-3. **(Optional) check progress**: `recorder_status()` — whether recording, per-type event counts, artifact directory
-4. **Wrap up**: `recorder_stop()` — generates the `report.md` summary and closes the browser (closing the window manually also finalizes the session)
-5. **Analyze and distill**: the model reads `report.md` + `events.jsonl`, generalizes “flow steps × API calls × request/response contract”, and further distills it into a skill or an API-integration guide
+1. **(Optional) driver opens the page first**: let playwright MCP open the target page; as long as the MCP browser was started with `--remote-debugging-port` (see “Collaboration prerequisite” below), `recorder_start` auto-discovers its CDP port and **attaches to that already-open window** — no new browser is launched
+2. **Arm the recorder**: `recorder_start()` — attaches to the existing window, or pops up the monitored browser and opens the start page; from this moment every operation and network request in the window is streamed to `events.jsonl`
+3. **Driver runs the flow**: let playwright MCP / browser-use (or a human) execute the whole target flow **inside the same monitored window** — opening pages, filling forms, clicking submit, going to the next page… both the UI events of each step and the API calls they trigger are captured
+4. **(Optional) check progress**: `recorder_status()` — whether recording, per-type event counts, artifact directory
+5. **Wrap up**: `recorder_stop()` — generates the `report.md` summary (in attach mode it only disconnects the CDP session and leaves the external browser running; plugin-launched windows are closed; closing the window manually also finalizes the session)
+6. **Analyze and distill**: the model reads `report.md` + `events.jsonl`, generalizes “flow steps × API calls × request/response contract”, and further distills it into a skill or an API-integration guide
 
 ### Collaboration prerequisite (important)
 
-- Recording covers **the browser window started by the plugin itself** (including its new tabs / iframes); operations by any driver (human or automation) are only captured when they happen **inside this window**.
-- Today the window is started by the plugin and meant for direct human operation. To have playwright MCP / browser-use drive **the same** window, the driver must be able to attach to that browser instance (shared instance / CDP connection) — not built in yet, see “Known limitations” below.
+- Recording covers **the browser window the plugin attached to / started** (including its new tabs / iframes); operations by any driver (human or automation) are only captured when they happen **inside this window**.
+- **Sharing one browser window with playwright MCP**: start the MCP browser with a remote debugging port and the recorder attaches automatically. Pass a config file to `@playwright/mcp` (`--config=path/to/playwright-mcp.config.json`) containing:
+  ```json
+  {
+    "browser": {
+      "launchOptions": {
+        "args": ["--remote-debugging-port=0"]
+      }
+    }
+  }
+  ```
+  With port `0`, Chrome picks a free port and writes it to the `DevToolsActivePort` file under its user-data-dir; `recorder_start` reads that file and attaches automatically (on Windows the MCP browser is located via the `ms-playwright-mcp` user-data-dir in the process command line). Without a debugging port the recorder cannot attach and falls back to takeover mode: it reads the MCP browser's current page URL, closes it, and re-opens the same page in a plugin-launched window.
+- You can also set `cdpUrl` explicitly in the plugin Config (e.g. `http://127.0.0.1:9222`) to choose the attach target; it takes precedence over auto-discovery. In attach mode `recorder_stop` only disconnects the CDP session and never closes the external browser process.
 
 ### Prerequisites and caveats
 
@@ -101,6 +113,7 @@ The model (agent) orchestrates the session: arm the recorder first, direct the d
 | ------------------------ | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `channel`                | `msedge`                                                      | playwright-core browser channel (`msedge` / `chrome`); uses a browser already installed locally, never downloads Chromium |
 | `executablePath`         | `''`                                                          | Custom browser executable path; overrides `channel` when non-empty                                                     |
+| `cdpUrl`                 | `''`                                                          | CDP endpoint (e.g. `http://127.0.0.1:9222`); when set, attach to that existing browser first. When empty, a Playwright MCP browser with a debugging port is auto-discovered and attached; otherwise falls back to takeover / launching a new window |
 | `outputDir`              | `''`                                                          | Root directory for artifacts; when empty, defaults to `reports/recorder` under the current working directory (the folder the user is working in, i.e. the harness session cwd) |
 | `captureResponseBodies`  | `true`                                                        | Whether to capture xhr / fetch response bodies                                                                          |
 | `maxBodyBytes`           | `16384`                                                       | Maximum number of bytes recorded for a single request / response body; anything beyond is truncated                     |
@@ -116,6 +129,7 @@ pnpm typecheck     # tsc --noEmit
 pnpm test          # vitest unit tests (pure functions for report generation)
 pnpm build         # tsdown output to lib/ (required by plugin loading and the smoke test)
 pnpm smoke         # real-Edge end-to-end smoke test (needs a browser installed locally; artifacts under reports/)
+pnpm smoke:mcp     # MCP auto-discovery attach smoke test (simulates an MCP Chrome with a debugging port)
 ```
 
 ## awesome-dsh-plugin compliance checklist
@@ -135,7 +149,7 @@ If you are submitting an entry to awesome-dsh-plugin:
 
 ## Known limitations
 
-- Records only the browser window started by the plugin itself (including its new tabs / iframes); operations in any other browser instance are not captured — including instances started by automation tools such as playwright MCP / browser-use. For automation-driven recording, the driver must attach to the same browser instance as the recorder (shared instance / CDP connection); this is not built in yet (roadmap item).
+- Records only the browser window the plugin attached to / started (including its new tabs / iframes); operations in any other browser instance are not captured. For automation-driven recording, the driver must share the same browser instance: when the MCP browser runs with `--remote-debugging-port` the recorder auto-attaches over CDP (see “Collaboration prerequisite”); an MCP browser without a debugging port can only be handled by the takeover fallback (close old window, open a new one).
 - Sensitive request headers are redacted by default; request / response bodies get no content-level redaction (they may contain business data such as tokens), so treat `events.jsonl` as sensitive data and do not share it.
 - UI events in cross-origin iframes rely on init-script injection; pages with very strict CSP may block the injection (network events are unaffected).
 - When a click fires an API request and the page navigates away immediately, the browser cancels the response-body capture; the response body may then be missing for that request (the event itself is still recorded, just without a body).

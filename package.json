@@ -1,7 +1,7 @@
 {
   "name": "dsh-web-recorder",
   "version": "0.1.2",
-  "description": "Browser-recording tools for DSH: opens a headed Edge window to record real clicks, inputs, navigation and network requests in a user-guided session, then generates a Markdown operation-timeline report (report.md with redacted request/response bodies and asset list) for the model to analyze and reproduce.",
+  "description": "Browser-recording tools for DSH: attaches over CDP to an already-open browser window (e.g. a Playwright MCP browser with a debugging port) or launches a headed browser, records real clicks, inputs, navigation and network requests in a user-guided session, then generates a Markdown operation-timeline report (report.md with redacted request/response bodies and asset list) for the model to analyze and reproduce.",
   "keywords": [
     "DSH",
     "browser",
@@ -33,7 +33,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "smoke": "node tests/smoke.mjs",
-    "smoke:cdp": "node tests/smoke-cdp.mjs"
+    "smoke:cdp": "node tests/smoke-cdp.mjs",
+    "smoke:mcp": "node tests/smoke-mcp-attach.mjs"
   },
   "dependencies": {
     "playwright-core": "^1.49.1"

@@ -2,9 +2,10 @@
  * 录制会话核心: 启动有头浏览器, 监听 UI 事件(点击/输入/提交)与网络事件(请求/响应/失败),
  * 内存留存全部事件供报告生成, 同时逐行写入 events.jsonl 防止进程崩溃丢数据。
  */
-import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs'
+import { createWriteStream, existsSync, mkdirSync, readFileSync, type WriteStream } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { execSync } from 'node:child_process'
 import {
   chromium,
   type Browser,
@@ -120,8 +121,10 @@ export class RecorderSession {
 
   /**
    * 启动浏览器并完成全部监听挂载; 失败时清理已建目录流。
-   * 优先尝试 CDP attach 到已运行的浏览器(如 Playwright 打开的页面),
-   * 失败时回退到新开浏览器窗口。
+   * attach 优先级: 显式配置的 cdpUrl → 自动发现 Playwright MCP 浏览器的 CDP 端口
+   * (读取其 user-data-dir 下的 DevToolsActivePort, 需 MCP 以 --remote-debugging-port 启动);
+   * 两者都不可用时回退到接管模式: 读取 MCP 浏览器当前页面 URL, 关闭旧浏览器,
+   * 用 recorder 新开窗口并导航到相同 URL。
    */
   static async start(
     startUrl: string | undefined,
@@ -133,10 +136,24 @@ export class RecorderSession {
     const dirName = `rec-${pad2(now.getHours())}-${pad2(now.getMinutes())}-${pad2(now.getSeconds())}`
     const session = new RecorderSession(opts, join(opts.outputDir, dirName))
     try {
-      // 先尝试 CDP attach 到已有浏览器
-      const attached = await session.tryAttach()
+      // 1. 显式配置的 CDP 地址优先
+      let attached = await session.tryAttach(opts.cdpUrl?.trim())
+      let playwrightMcpUrl: string | undefined
       if (!attached) {
-        // 回退: 新开浏览器窗口
+        // 2. 自动发现 Playwright MCP 浏览器的 CDP 端口, attach 到用户正在使用的窗口
+        const mcpCdpUrl = session.discoverMcpCdpUrl()
+        if (mcpCdpUrl) attached = await session.tryAttach(mcpCdpUrl)
+      }
+      if (!attached) {
+        // 3. 回退接管: 检测 Playwright MCP 浏览器, 关掉后用 recorder 新开窗口
+        playwrightMcpUrl = session.detectPlaywrightMcpBrowser()
+        if (playwrightMcpUrl) {
+          // 关闭 Playwright MCP 浏览器进程
+          session.killPlaywrightMcpBrowser()
+          // 等待进程退出
+          await new Promise(resolve => setTimeout(resolve, 1500))
+        }
+        // 新开浏览器窗口(优先使用接管的 URL)
         session.browser = await chromium.launch({
           headless: false,
           ...(opts.executablePath.trim()
@@ -152,6 +169,13 @@ export class RecorderSession {
         }
       )
       await session.context!.addInitScript(INIT_SCRIPT)
+      // attach 模式下已加载的页面不会触发 init script, 直接 evaluate 补装采集脚本
+      // (脚本内 __huafengRecorderInstalled 守卫保证后续导航不重复安装)
+      if (attached) {
+        for (const page of session.context!.pages()) {
+          await page.evaluate(INIT_SCRIPT).catch(() => undefined)
+        }
+      }
       session.context!.on('page', page => session.attachPage(page))
       // 用户直接关掉浏览器时自动收尾, 已录数据不丢; stop() 主动关窗时用 stop 的真实原因
       if (!session.attached) {
@@ -162,8 +186,12 @@ export class RecorderSession {
         })
       }
       for (const page of session.context!.pages()) session.attachPage(page)
-      const page = session.context!.pages()[0] ?? (await session.context!.newPage())
-      if (startUrl?.trim()) await page.goto(startUrl.trim(), { waitUntil: 'domcontentloaded' })
+      // attach 模式只在调用方显式传入 URL 时才导航当前页, 否则保持用户正在看的页面不动
+      const finalUrl = startUrl?.trim() || playwrightMcpUrl
+      if (finalUrl?.trim()) {
+        const page = session.context!.pages()[0] ?? (await session.context!.newPage())
+        await page.goto(finalUrl.trim(), { waitUntil: 'domcontentloaded' })
+      }
       return session
     } catch (cause) {
       session.jsonl.end()
@@ -171,18 +199,145 @@ export class RecorderSession {
     }
   }
 
+  /**
+   * 执行 PowerShell 脚本并返回 stdout。统一走 -EncodedCommand(UTF-16LE base64):
+   * 脚本内含双引号(如正则 [^\s"])时, -Command "..." 经 cmd.exe + powershell 双层引号
+   * 解析会断裂静默失败, EncodedCommand 完全绕开该问题。
+   */
+  private runPowerShell(script: string): string {
+    const encoded = Buffer.from(script, 'utf16le').toString('base64')
+    return execSync(`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`, {
+      encoding: 'utf8',
+      timeout: 10000
+    })
+  }
+
+  /** 查找正在运行的 Playwright MCP 浏览器的 user-data-dir(Windows: PowerShell CIM 查进程命令行)。 */
+  private findMcpUserDataDir(): string | undefined {
+    try {
+      // Windows: 通过 PowerShell CIM 查找包含 ms-playwright-mcp 的浏览器进程
+      const psScript = `
+        Get-CimInstance Win32_Process | Where-Object {
+          ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') -and
+          $_.CommandLine -match 'ms-playwright-mcp' -and
+          $_.CommandLine -notmatch '--type='
+        } | ForEach-Object {
+          if ($_.CommandLine -match '--user-data-dir="?([^\\s"]+)') { $Matches[1] }
+        } | Select-Object -First 1
+      `
+      const userDataDir = this.runPowerShell(psScript).trim()
+      return userDataDir || undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 自动发现 Playwright MCP 浏览器的 CDP 地址: MCP 以 --remote-debugging-port 启动时,
+   * Chrome 会把实际端口写入 user-data-dir 下的 DevToolsActivePort 文件(第一行)。
+   * 读到则返回 http://127.0.0.1:<port>, 供 tryAttach 直接 attach 到用户正在使用的窗口。
+   */
+  private discoverMcpCdpUrl(): string | undefined {
+    try {
+      const userDataDir = this.findMcpUserDataDir()
+      if (!userDataDir) return undefined
+      const portFile = join(userDataDir, 'DevToolsActivePort')
+      if (!existsSync(portFile)) return undefined
+      const port = Number(readFileSync(portFile, 'utf8').split('\n')[0]?.trim())
+      if (!Number.isInteger(port) || port <= 0) return undefined
+      return `http://127.0.0.1:${port}`
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 检测是否有 Playwright MCP 浏览器在运行(通过查找 ms-playwright-mcp user-data-dir 的进程)。
+   * 若找到, 从其 Chrome Tabs 文件中提取最近访问的 URL 并返回; 否则返回 undefined。
+   */
+  private detectPlaywrightMcpBrowser(): string | undefined {
+    const userDataDir = this.findMcpUserDataDir()
+    if (!userDataDir) return undefined
+    // 从 Chrome Tabs 文件中提取最近访问的 URL
+    return this.extractUrlFromTabs(userDataDir)
+  }
+
+  /** 从 Chrome 的 Sessions 目录中提取最近访问的 URL(读取 Tabs 文件, 其中包含明文 URL)。 */
+  private extractUrlFromTabs(userDataDir: string): string | undefined {
+    try {
+      const sessionsDir = join(userDataDir, 'Default', 'Sessions')
+      if (!existsSync(sessionsDir)) return undefined
+
+      // 找最新的非空 Tabs 文件
+      const files = execSync(`dir /b /o-d "${sessionsDir}\\Tabs_*" 2>nul`, {
+        encoding: 'utf8',
+        timeout: 5000,
+        shell: 'cmd.exe'
+      })
+        .split('\n')
+        .map(f => f.trim())
+        .filter(f => f.startsWith('Tabs_'))
+      if (files.length === 0) return undefined
+
+      for (const file of files) {
+        const filePath = join(sessionsDir, file)
+        try {
+          const bytes = readFileSync(filePath)
+          if (bytes.length === 0) continue
+          const content = bytes.toString('ascii')
+          // 匹配 http/https URL, 优先取带路径的(排除纯域名)
+          const urls = content.match(/https?:\/\/[^\x00-\x1F\x7F\s"'<>]+/g) || []
+          // 过滤: 优先选择包含路径的 URL(不只是域名)
+          const withPath = urls.filter(u => {
+            try {
+              const url = new URL(u)
+              return url.pathname !== '/' && url.pathname !== ''
+            } catch {
+              return false
+            }
+          })
+          if (withPath.length > 0) {
+            // 去重并返回最后一个(通常是最新访问的)
+            const unique = [...new Set(withPath)]
+            return unique[unique.length - 1]
+          }
+        } catch {
+          continue
+        }
+      }
+      return undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 关闭 Playwright MCP 浏览器进程(通过 PowerShell Stop-Process)。 */
+  private killPlaywrightMcpBrowser(): void {
+    try {
+      const psScript = `
+        Get-CimInstance Win32_Process | Where-Object {
+          ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') -and
+          $_.CommandLine -match 'ms-playwright-mcp'
+        } | ForEach-Object {
+          Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+      `
+      this.runPowerShell(psScript)
+    } catch {
+      // 忽略错误, 即使关闭失败也继续新开浏览器
+    }
+  }
+
   /** 尝试通过 CDP attach 到已运行的浏览器(如 Playwright 打开的页面)。成功返回 true。 */
-  private async tryAttach(): Promise<boolean> {
-    const cdpUrl = this.opts.cdpUrl?.trim()
+  private async tryAttach(cdpUrl?: string): Promise<boolean> {
     if (!cdpUrl) return false
     try {
       this.browser = await chromium.connectOverCDP(cdpUrl)
       this.attached = true
-      // connectOverCDP 返回的 browser 可能已有 context, 取第一个或新建
+      // connectOverCDP 返回的 browser 可能已有 context, 优先取已有页面的(用户正在用的窗口), 否则取第一个或新建
       const contexts = this.browser.contexts()
-      if (contexts.length > 0) {
-        this.context = contexts[0]
-      } else {
+      this.context = contexts.find(c => c.pages().length > 0) ?? contexts[0]
+      if (!this.context) {
         this.context = await this.browser.newContext({ viewport: null })
       }
       // CDP attach 模式下, 通过 CDP session 监听浏览器关闭
@@ -204,6 +359,11 @@ export class RecorderSession {
   /** 供高级调用方(冒烟测试等)拿到当前页面对象。 */
   pages(): Page[] {
     return this.context?.pages() ?? []
+  }
+
+  /** 是否为 CDP attach 模式(attach 到已有浏览器窗口, 而非插件自启的窗口)。 */
+  isAttached(): boolean {
+    return this.attached
   }
 
   isFinished(): boolean {
