@@ -265,6 +265,10 @@ export class RecorderSession {
     if (this.pageIds.has(page)) return
     this.pageIds.set(page, this.nextPageId++)
     this.openPages++
+    // 新打开的 tab/popup 也要确保装上 UI 事件采集脚本。
+    // addInitScript 理论上会自动注入，但 CDP attach 模式或某些 race 情况下可能漏注，
+    // 这里显式补装作为双重保险；安装失败静默忽略，不影响网络事件监听。
+    void page.evaluate(INIT_SCRIPT).catch(() => undefined)
     // 任何窗口/标签被关都立刻感知: 计数归零后延迟确认(允许操作途中短暂无页面),
     // 仍无页面则视为用户关闭浏览器, 自动收尾生成报告(兜底 disconnected 未触发的情况)。
     page.on('close', () => {
