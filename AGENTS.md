@@ -14,11 +14,11 @@
 
 | 工具 | 说明 |
 | --- | --- |
-| `recorder_start(url?, waitSeconds?)` | 开始录制：attach 到已有浏览器窗口（cdpUrl / 自动发现 MCP CDP 端口）或启动有头浏览器，可导航到起始 URL；`waitSeconds` 让录制先等 N 秒再记录（跳过登录/初始化噪音），默认 0 立即记录 |
+| `recorder_start(url?, waitSeconds?)` | 开始录制：attach 到已有浏览器窗口（cdpUrl / 自动发现 MCP CDP 端口）或启动有头浏览器，可导航到起始 URL；`waitSeconds` 让录制先等 N 秒再记录（跳过登录/初始化噪音），默认 0 立即记录；同时把本次录制登记为宿主后台任务并返回 `jobId` |
 | `recorder_stop()` | 停止录制：生成 `report.md`；attach 模式只断开 CDP 连接，插件自启窗口才关闭；幂等 |
-| `recorder_status()` | 查询状态：是否在录制、事件计数、产物目录、上次收尾结果 |
+| `recorder_status()` | 查询状态：是否在录制、事件计数、产物目录、`jobId`、上次收尾结果 |
 
-用户直接关掉浏览器窗口会自动收尾（`reason: browser-closed`），已录数据不丢。
+用户直接关掉浏览器窗口会自动收尾（`reason: browser-closed`），已录数据不丢；此时后台任务随之结算，模型收到完成通知被唤醒继续总结（见「后台任务」约定）。
 
 ## 技术栈
 
@@ -62,7 +62,8 @@ src/
               channel / executablePath, attach 优先、失败回退接管或新开)、注入 INIT_SCRIPT(捕获阶段
               监听 click/change/submit, 经 exposeBinding 回传 UI 事件; attach 模式对已加载页面
               直接 evaluate 补装)、监听 request/response/requestfailed/console 事件, 事件内存留存
-              + 逐行写 events.jsonl; stop() 幂等收尾, 浏览器被关闭时自动 finalize。
+              + 逐行写 events.jsonl; finished() 暴露「收尾完成」信号供宿主后台任务结算;
+              stop() 幂等收尾, 浏览器被关闭时自动 finalize。
               finalize 经 finalizePromise 去重(stop / 关窗口 / 插件卸载可能并发触发), 只跑一次。
   report.ts   generateMarkdown(events, meta): 从事件序列生成 Markdown 摘要
               (统计概览 + 操作时间线 + 网络请求明细表 + 失败请求), 纯函数。
@@ -101,6 +102,8 @@ assets/           README 截图与封面
 - 错误返回统一走 `toolError({type, message, hint})` 信封（`type: 'state' | 'browser' | 'internal'`），工具的 `output.render` 负责把结果渲染成给模型看的文本。
 - `RecorderSession.stop()` / `finalize()` 必须幂等：用户关浏览器、插件卸载、`recorder_stop` 三条路径会并发触发收尾，`stopResult` 只允许设置一次；报告生成/写盘失败不得阻断收尾。
 - 页面/请求映射（`pageIds` / `requestIds`）用 `WeakMap`：不持强引用，长时间录制不会把已关闭的页面与已完成请求堆积在内存；请求失败（终态）时主动 `delete`。
+- `ctx.jobs`（宿主后台任务运行时）是**可选能力**，不得写进 `inject`：运行时用 `ctx.get('jobs')` 取，取不到就退化（不返回 `jobId`，行为与加入该能力前一致）；类型上只声明用到的成员的本地最小接口（`JobsRuntime`），避免为可选能力引入 `@deepseek-ai/dsh-jobs` 依赖。
+- 后台任务的结算只走 `RecorderSession.finished()`（收尾 → job 结算 → 宿主通知模型），`job.hooks.cancel` 落到 `session.stop()`；`recorder_stop` 拿到结果后再 `read` 一次把任务标为已报告，避免模型重复收到完成通知。
 - 事件计数只走 `src/stats.ts`：会话侧 `push` 时增量累加，报告侧 `countEvents` 一次性统计，两处不得各写一份 `switch`。
 - 等待期（前置剔除）只有 `waitSeconds` 一个入参（工具调用时传，默认 0），不进 Config；丢弃逻辑集中在 `RecorderSession.waiting()` 与各事件入口的早退分支，等待期内被丢的事件只累计 `skipped` 供回显。
 - 启动中途失败要释放已建的浏览器与事件流；attach 失败同样要断开已建立的连接（`start` / `tryAttach` 的 catch 里处理）。

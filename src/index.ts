@@ -5,7 +5,8 @@
  *   recorder_start(url?) —— 优先 CDP attach 到正在运行的浏览器窗口(显式 cdpUrl 或自动发现
  *     带 CDP 端口的 Playwright MCP 浏览器), 否则启动有头浏览器(默认本机 Edge), 用户在其中手动操作;
  *     插件监听每次点击/输入/表单提交(init script + exposeBinding)和每个网络请求/响应/失败,
- *     事件实时落盘 events.jsonl(防崩溃丢失)
+ *     事件实时落盘 events.jsonl(防崩溃丢失)。同时把本次录制登记为宿主后台任务(ctx.jobs),
+ *     这样用户操作完 / 关掉浏览器时, 模型会收到任务完成通知被唤醒继续总结
  *   recorder_stop()      —— 停止录制, 生成 report.md 摘要报告, 关闭浏览器;
  *     用户直接关掉浏览器窗口也会自动收尾
  *   recorder_status()    —— 查询录制状态与事件计数
@@ -107,7 +108,103 @@ type StartSuccess = {
   attached: boolean
   initialUrl?: string
   waitSeconds?: number
+  /** 本次录制在宿主后台任务运行时里的 id(如 recorder-1); 宿主未提供该能力时不存在 */
+  jobId?: string
   hint: string
+}
+
+/**
+ * 宿主可选的后台任务运行时(ctx.jobs)的最小接口: 只声明用到的成员。
+ *
+ * 刻意用结构化类型而不 import @deepseek-ai/dsh-jobs —— 后台任务是「有则更好」的能力:
+ * 宿主没加载 dsh-jobs / dsh-tool-jobs 时 ctx.get('jobs') 为 undefined, 插件退回旧行为
+ * (模型需等用户回来告知), 而不是整个插件因缺依赖不可用(与 dsh-tool-bash 处理后台任务的思路一致)。
+ */
+type JobsRuntime = {
+  start(spec: {
+    kind: string
+    label: string
+    owner?: unknown
+    outputLimitBytes?: number
+    run(): {
+      cancel(reason?: string): void
+      done: Promise<{ status: 'completed' | 'killed' | 'failed'; detail?: string; output?: string }>
+    }
+  }): string
+  read(id: string, caller?: unknown): unknown
+}
+
+/** 结算那一刻交给模型看的输出: 产物路径 + 统计 + 明确的下一步动作。 */
+function jobOutput(result: StopResult): string {
+  const seconds = ((result.endedAt - result.startedAt) / 1000).toFixed(1)
+  return [
+    `录制结束(原因: ${result.reason}), 时长 ${seconds}s, 共 ${result.eventCount} 个事件。`,
+    `点击 ${result.stats.clicks} 次, 输入 ${result.stats.changes} 次, ` +
+      `请求 ${result.stats.requests} 个(其中失败 ${result.stats.failed})。`,
+    ...(result.waitSeconds > 0
+      ? [`等待期 ${result.waitSeconds}s 内的 ${result.skippedEvents} 个事件已丢弃。`]
+      : []),
+    `报告摘要: ${result.reportPath}`,
+    `完整明细: ${result.eventsPath}(含请求头/请求体/响应体)`,
+    '下一步: 读 report.md 归纳「业务流程 × 接口调用序列 × 数据契约」, 需要字段级细节再查 events.jsonl。'
+  ].join('\n')
+}
+
+/**
+ * 把一次录制登记为后台任务, 使「录制结束」成为宿主会通知模型的事件。
+ * @returns job id; 宿主未提供后台任务能力(或归属的 agent 无法收通知)时返回 undefined。
+ */
+function registerRecorderJob(
+  ctx: Context,
+  session: RecorderSession,
+  agent: unknown,
+  label: string
+): string | undefined {
+  const jobs = ctx.get('jobs') as JobsRuntime | undefined
+  if (!jobs) return undefined
+  try {
+    return jobs.start({
+      kind: 'recorder',
+      label,
+      // 归属调用方 agent: 完成通知只投递给它(繁忙时注入下一步, 空闲时唤醒一轮,
+      // 正是「用户关浏览器后模型自动接着总结」所依赖的机制)
+      ...(agent ? { owner: agent } : {}),
+      outputLimitBytes: 4096,
+      run: () => {
+        let cancelled = false
+        return {
+          // 模型/宿主 kill 该 job 即停止录制(幂等, 与用户关浏览器同一套收尾)
+          cancel: reason => {
+            cancelled = true
+            void session.stop(reason || 'job-killed')
+          },
+          done: session
+            .finished()
+            .then(result => ({
+              status: (cancelled ? 'killed' : 'completed') as 'killed' | 'completed',
+              detail: result.reason,
+              output: jobOutput(result)
+            }))
+        }
+      }
+    })
+  } catch {
+    // 宿主不允许为这个 owner 起任务(如未挂载 job controller)时静默降级: 录制照常进行
+    return undefined
+  }
+}
+
+/**
+ * recorder_stop 已经把结果当面给了模型, 再发一条后台任务完成通知就多余了:
+ * 抢先读一次把任务标为已报告, 抑制重复通知(读取未结算则无效, 无害)。
+ */
+function suppressJobNotice(ctx: Context, jobId: string | undefined, caller: unknown): void {
+  if (!jobId) return
+  try {
+    ;(ctx.get('jobs') as JobsRuntime | undefined)?.read(jobId, caller)
+  } catch {
+    // 未知/已结算任务可能抛错, 忽略: 最坏情况是模型多收到一条通知
+  }
 }
 
 type StartResult = StartSuccess | { ok: false; error: ToolError }
@@ -136,6 +233,7 @@ type StatusSuccess = {
   waitSeconds?: number
   waitRemainingSec?: number
   skippedEvents?: number
+  jobId?: string
   lastResult?: JsonValue
 }
 
@@ -163,6 +261,8 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
 
   let session: RecorderSession | null = null
   let lastResult: StopResult | null = null
+  /** 当前/最近一次录制对应的后台任务 id(宿主提供该能力时存在) */
+  let currentJobId: string | undefined
 
   // 活跃会话已收尾(用户关浏览器自动 finalize)时把结果转移到 lastResult 并清掉
   const clearFinished = (): void => {
@@ -193,7 +293,9 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
         '插件在后台记录每次点击/输入/表单提交和每个网络请求/响应/失败, 实时落盘 events.jsonl。' +
         '入参 waitSeconds 可让录制先等待若干秒再开始记录(等价剔除开头这段时间), 用于跳过登录页 / ' +
         '页面初始化那批与业务流程无关的请求。' +
-        '用 recorder_stop 结束并生成 report.md 报告; 用户直接关掉浏览器窗口也会自动收尾。',
+        '本次录制会登记为后台任务并返回 jobId: 用户操作完(或直接关掉浏览器窗口)后你会自动收到' +
+        '任务完成通知, 无需轮询, 届时用 job_output 取回产物路径与统计并继续总结;' +
+        '也可用 recorder_stop 主动结束并生成 report.md 报告。',
       parameters: {
         url: { type: 'string', description: '起始 URL, 留空则打开空白页' },
         waitSeconds: {
@@ -216,6 +318,10 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
             waitSeconds: {
               type: 'number',
               description: '等待多少秒后开始记录(0 表示立即开始); 等待期内的事件不记录'
+            },
+            jobId: {
+              type: 'string',
+              description: '本次录制的后台任务 id(宿主提供该能力时存在); 完成时你会收到通知'
             },
             hint: { type: 'string', description: '给模型的下一步指引' },
             error: {
@@ -244,7 +350,11 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
                 (value.waitSeconds && value.waitSeconds > 0
                   ? `前 ${value.waitSeconds}s 为等待期(期间的操作与请求不记录), 请在这段时间内完成登录 / 等页面加载完成。\n`
                   : '') +
-                `请用户在浏览器中手动操作; 完成后调用 recorder_stop 生成报告。`
+                `请用户在浏览器中手动操作。\n` +
+                (value.jobId
+                  ? `本次录制已登记为后台任务 ${value.jobId}: 用户操作完或直接关掉浏览器后, 你会收到任务完成通知;` +
+                    `届时用 job_output 取回产物路径与统计, 再读 report.md 总结。不要轮询 recorder_status。`
+                  : `完成后调用 recorder_stop 生成报告并总结。`)
             }
           ]
         }
@@ -290,6 +400,13 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           })
         }
         session = started
+        // 登记为后台任务: 用户关浏览器 / 调 stop 时 job 结算, 通知会唤醒模型继续总结
+        currentJobId = registerRecorderJob(
+          ctx,
+          started,
+          exec.agent,
+          `网页操作录制${url ? `: ${url}` : ''}`
+        )
         return {
           ok: true,
           sessionDir: session.sessionDir,
@@ -297,8 +414,12 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           attached: session.isAttached(),
           ...(url ? { initialUrl: url } : {}),
           ...(waitSeconds > 0 ? { waitSeconds } : {}),
-          hint:
-            waitSeconds > 0
+          ...(currentJobId ? { jobId: currentJobId } : {}),
+          hint: currentJobId
+            ? waitSeconds > 0
+              ? `已登记后台任务 ${currentJobId}: 等待 ${waitSeconds}s(请在这段时间内完成登录 / 等页面加载完成)后开始记录用户操作; 录制结束(用户关浏览器或调用 recorder_stop)时会收到完成通知, 届时用 job_output 取回产物路径与统计并总结`
+              : `已登记后台任务 ${currentJobId}: 用户操作期间不必轮询, 录制结束(关浏览器或调用 recorder_stop)会收到完成通知, 届时用 job_output 取回产物路径与统计并总结`
+            : waitSeconds > 0
               ? `等待 ${waitSeconds}s 后开始记录, 请在这段时间内完成登录 / 等页面加载完成; 之后用户操作会被记录, 完成后调用 recorder_stop 生成报告`
               : '用户操作完成后调用 recorder_stop 停止并生成报告'
         }
@@ -359,12 +480,15 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           ]
         }
       },
-      async execute(): Promise<StopResultOut> {
+      async execute(_args, exec): Promise<StopResultOut> {
         const active = takeActive()
         if (!(active instanceof RecorderSession)) return active
         const result = await active.stop('user-stop')
         lastResult = result
         session = null
+        // stop 的结果已经当面给了模型: 等后台任务结算完再读一次, 抑制那条重复的完成通知
+        await new Promise<void>(resolve => setTimeout(resolve, 0))
+        suppressJobNotice(ctx, currentJobId, exec.agent)
         return {
           ok: true,
           reason: result.reason,
@@ -404,6 +528,7 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
             waitSeconds: { type: 'number', description: '本次录制的等待秒数(0 表示立即开始记录)' },
             waitRemainingSec: { type: 'number', description: '等待期剩余秒数(已开始记录时为 0)' },
             skippedEvents: { type: 'number', description: '等待期内已丢弃的事件数' },
+            jobId: { type: 'string', description: '本次录制对应的后台任务 id' },
             lastResult: { type: 'json', description: '上一次录制的收尾结果' }
           }
         },
@@ -419,7 +544,8 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
                   (value.waitRemainingSec && value.waitRemainingSec > 0
                     ? `仍在等待期(共 ${value.waitSeconds}s, 还剩 ${value.waitRemainingSec}s), 此期间操作不记录。\n`
                     : '') +
-                  `产物目录: ${value.sessionDir}`
+                  `产物目录: ${value.sessionDir}` +
+                  (value.jobId ? `\n后台任务: ${value.jobId}(录制结束会自动通知你)` : '')
               }
             ]
           }
@@ -450,7 +576,8 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           counts: s.counts,
           waitSeconds: s.waitSeconds,
           waitRemainingSec: s.waitRemainingSec,
-          skippedEvents: s.skippedEvents
+          skippedEvents: s.skippedEvents,
+          ...(currentJobId ? { jobId: currentJobId } : {})
         }
       }
     })

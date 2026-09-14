@@ -105,11 +105,13 @@ dsh plugin --profile web add dsh-web-recorder@latest
 
 | 工具                   | 说明                                                                    |
 | ---------------------- | ----------------------------------------------------------------------- |
-| `recorder_start(url?, waitSeconds?)` | 开始录制：优先 attach 到已有浏览器窗口（`cdpUrl` / 自动发现带调试端口的 Playwright MCP 浏览器），否则启动有头浏览器并可导航到起始 URL；`waitSeconds` 可让录制先等 N 秒再记录（跳过登录 / 初始化）；事件实时落盘 `events.jsonl` |
+| `recorder_start(url?, waitSeconds?)` | 开始录制：优先 attach 到已有浏览器窗口（`cdpUrl` / 自动发现带调试端口的 Playwright MCP 浏览器），否则启动有头浏览器并可导航到起始 URL；`waitSeconds` 可让录制先等 N 秒再记录（跳过登录 / 初始化）；事件实时落盘 `events.jsonl`。返回时会把本次录制登记为后台任务并返回 `jobId` |
 | `recorder_stop()`      | 停止录制：生成 `report.md` 摘要报告；attach 模式只断开 CDP 连接，插件自启的窗口才关闭；幂等       |
-| `recorder_status()`    | 查询状态：是否在录制、事件分类计数、产物目录、上一次收尾结果            |
+| `recorder_status()`    | 查询状态：是否在录制、事件分类计数、产物目录、`jobId`、上一次收尾结果            |
 
 用户直接关掉浏览器窗口会自动收尾（`reason: browser-closed`），已录数据不丢。
+
+**录制结束会主动把模型接回来**：`recorder_start` 同时把本次录制登记为宿主的后台任务（`ctx.jobs`，`<jobId>` 形如 `recorder-1`，归属发起调用的 agent）。用户操作完直接关掉浏览器（或调用 `recorder_stop`）时任务结算，模型在会话内收到完成通知——空闲时被唤醒开新的一轮，繁忙时注入下一步——随后即可用 `job_output` 取回产物路径与统计并接着总结，不必轮询 `recorder_status`。宿主未加载后台任务能力（`dsh-jobs` / `dsh-tool-jobs`）时自动退化为原行为（无 `jobId`，仍需 `recorder_stop` 或用户一句话把结果交给模型）。
 
 ## 使用方法:如何命中本插件
 
@@ -145,9 +147,9 @@ dsh plugin --profile web add dsh-web-recorder@latest
 1. **（可选，有 MCP 时推荐）驱动方先把页面打开**：让 playwright MCP 打开目标页面；只要 MCP 浏览器以 `--remote-debugging-port` 启动（见下文「协同前提」），`recorder_start` 会自动发现它的 CDP 端口并 **attach 到这个已打开的窗口**，无需新开浏览器，MCP 也能继续在这个窗口上操作。**没有 playwright MCP 就跳过本步**，直接进第 2 步，由真人在插件弹出的窗口里操作
 2. **记录仪就位**：`recorder_start()`——attach 到已有窗口，或弹出受监控浏览器并打开起始页，从此刻起窗口内一切操作与网络请求都开始实时落盘 `events.jsonl`（注意：从这一刻起发生的页面加载也会被录进来，见下文「初始化请求噪音」）
 3. **驱动方执行流程**：让 playwright MCP / browser-use（或真人）**在同一个受监控窗口里**逐步完成目标流程——打开各页面、填写表单、点击提交、翻页……每步操作的 UI 事件和它触发的接口调用都会被同时录下
-4. **（可选）查进度**：`recorder_status()`——查看是否在录制、事件分类计数、产物目录
-5. **收尾**：`recorder_stop()`——生成 `report.md` 摘要报告（attach 模式只断开 CDP 连接，不关闭外部浏览器；插件自启的窗口会关闭；用户直接关窗口也会自动收尾）
-6. **分析沉淀**：模型读取 `report.md` + `events.jsonl`，归纳「流程步骤 × 接口调用 × 请求/响应契约」，进一步沉淀为 skill 或接口对接文档
+4. **（可选）查进度**：`recorder_status()`——查看是否在录制、事件分类计数、产物目录、`jobId`
+5. **收尾**：`recorder_stop()`——生成 `report.md` 摘要报告（attach 模式只断开 CDP 连接，不关闭外部浏览器；插件自启的窗口会关闭；用户直接关窗口也会自动收尾）。录完可以什么都不做直接关窗口：后台任务会结算并通知模型
+6. **分析沉淀**：模型收到后台任务完成通知后读取 `report.md` + `events.jsonl`，归纳「流程步骤 × 接口调用 × 请求/响应契约」，进一步沉淀为 skill 或接口对接文档
 
 ### 协同前提（重要）
 

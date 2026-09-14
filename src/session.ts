@@ -62,6 +62,13 @@ export class RecorderSession {
   private stopResult?: StopResult
   /** 收尾的进行中 promise: stop / 关窗口 / 插件卸载可能并发触发, 只执行一次 */
   private finalizePromise?: Promise<StopResult>
+  /** finished 的 resolve 侧(见 finished()): 构造时建好, 收尾时只调用一次 */
+  private finishedResolve!: (result: StopResult) => void
+  /**
+   * 收尾完成信号: resolve 后携带最终 StopResult, 永不 reject。
+   * 供宿主后台任务(ctx.jobs)结算用 —— 会话不收尾就保持 pending, 正是「录制仍在运行」的语义。
+   */
+  private readonly finishedPromise: Promise<StopResult>
 
   private constructor(opts: RecorderOptions, sessionDir: string) {
     this.opts = opts
@@ -69,6 +76,9 @@ export class RecorderSession {
     this.eventsPath = join(sessionDir, 'events.jsonl')
     mkdirSync(sessionDir, { recursive: true })
     this.jsonl = createWriteStream(this.eventsPath, { flags: 'w' })
+    this.finishedPromise = new Promise<StopResult>(resolve => {
+      this.finishedResolve = resolve
+    })
     // 等待期: waitSeconds 非法(非数字/负数)时按 0 处理, 避免 NaN 比较导致行为不确定
     const seconds = Number(opts.waitSeconds)
     this.waitSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : 0
@@ -207,6 +217,15 @@ export class RecorderSession {
   /** 已收尾会话的最终结果(用户直接关浏览器自动收尾时也存在)。 */
   result(): StopResult | undefined {
     return this.stopResult
+  }
+
+  /**
+   * 等到本次录制真正收尾(报告已落盘)为止; 已收尾则立即返回既有结果。
+   * 宿主后台任务用它把「录制结束」这一刻结算成 job 完成, 从而通知模型。
+   * 会话永不收尾时不 resolve —— 调用方应同时提供 cancel 通道(见 index.ts 的 job 注册)。
+   */
+  finished(): Promise<StopResult> {
+    return this.finishedPromise
   }
 
   status(): {
@@ -489,6 +508,8 @@ export class RecorderSession {
       waitSeconds: this.waitSeconds,
       skippedEvents: this.skipped
     }
+    // 收尾即「录制结束」事件: 唤醒等待方(宿主后台任务的结算链)
+    this.finishedResolve(this.stopResult)
     return this.stopResult
   }
 }
