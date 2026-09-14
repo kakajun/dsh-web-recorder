@@ -236,7 +236,7 @@ pnpm smoke:mcp     # MCP 浏览器自动发现 attach 冒烟(模拟带调试端�
 pnpm smoke:wait    # 等待期(前置剔除)冒烟: 验证 waitSeconds 等待期内不记录、等待期后正常记录
 ```
 
-## 仓库收录清单(awesome-dsh-plugin)
+## 仓库已被收录在 awesome-dsh-plugin
 
 本仓库已按 awesome-dsh-plugin/contributing 对齐:
 
@@ -244,12 +244,6 @@ pnpm smoke:wait    # 等待期(前置剔除)冒烟: 验证 waitSeconds 等待期
 - 官方 `@deepseek-ai/*` 包放在 `peerDependencies`: `dsh-tools` 的范围带显式预发布分支(harness 以 rc 版本发布, 无分支的宽范围会被 node-semver 静默排除), `cordis`/`schemastery` 同为 peer 由宿主提供
 - 运行时默认产物输出到**当前工作目录（用户正在操作的文件夹）**下 `reports/recorder`，可用 `Config.outputDir` 显式指定
 - 附带真实冒烟测试 `tests/smoke.mjs`, 非占位仓库
-
-若提交 awesome-dsh-plugin 收录条目:
-
-1. 在 GitHub 仓库 Settings → Topics 添加 `dsh-plugin`
-2. 一句话描述与代码实际能力一致、不夸大(例如称"3 个工具"就必须真有 3 个)
-3. 可选: 发布 npm(须保证 `repository` 指回本仓库, 并去掉 `private: true`); 可选在仓库根放 `screenshots.json`
 
 ## 已知限制
 
