@@ -1,5 +1,14 @@
 # dsh-web-recorder
 
+<p align="center">
+  <a href="https://www.npmjs.com/package/dsh-web-recorder"><img alt="npm" src="https://img.shields.io/npm/v/dsh-web-recorder?label=npm&color=cb3837"></a>
+  <a href="https://www.npmjs.com/package/dsh-web-recorder"><img alt="downloads" src="https://img.shields.io/npm/dm/dsh-web-recorder?label=downloads&color=brightgreen"></a>
+  <a href="https://github.com/kakajun/dsh-web-recorder/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/kakajun/dsh-web-recorder/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/kakajun/dsh-web-recorder/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/kakajun/dsh-web-recorder?style=social"></a>
+  <a href="https://github.com/kakajun/dsh-web-recorder/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/kakajun/dsh-web-recorder?label=License&color=yellow"></a>
+  <a href="https://dshfind.com/en/plugins/kakajun/dsh-web-recorder?ref=badge"><img alt="dshfind" src="https://dshfind.com/api/badge/kakajun/dsh-web-recorder"></a>
+</p>
+
 **Languages: English · [简体中文](README.md)**
 
 A browser-operation recorder plugin for DSH. It targets the scenario where a human drives the browser while the plugin records in the background: it can attach to an already-open browser window (e.g. a Playwright MCP browser with a debugging port — **this is optional**), or launch its own headed browser window (the local Edge by default); as you interact with pages normally, the plugin records every click / input / form submission and every network request / response / failure, then generates a Markdown summary report when recording stops.
@@ -197,3 +206,13 @@ If you are submitting an entry to awesome-dsh-plugin:
 - Sensitive request headers are redacted by default; request / response bodies get no content-level redaction (they may contain business data such as tokens), so treat `events.jsonl` as sensitive data and do not share it.
 - UI events in cross-origin iframes rely on init-script injection; pages with very strict CSP may block the injection (network events are unaffected).
 - When a click fires an API request and the page navigates away immediately, the browser cancels the response-body capture; the response body may then be missing for that request (the event itself is still recorded, just without a body).
+
+## PRs and issues are welcome
+
+The plugin is still being polished, and any kind of participation is welcome:
+
+- **Open an issue**: [report a problem or share an idea](https://github.com/kakajun/dsh-web-recorder/issues/new) — missed events, attach failures, or missing fields in `report.md` are all fair game. Logs and screenshots make triage much faster; **please do not paste raw `events.jsonl`** (it contains full request headers / bodies).
+- **Send a PR**: [fork and open a pull request](https://github.com/kakajun/dsh-web-recorder/pulls) — new event types, better report rendering, more smoke tests or docs are all welcome. Please run `pnpm typecheck && pnpm test` before sending; if you touched event capture in `session.ts`, also run `pnpm build && pnpm smoke`.
+- A [star](https://github.com/kakajun/dsh-web-recorder/stargazers) is appreciated too.
+
+If you have an idea but are unsure whether it fits, open an issue first and let's talk it through.

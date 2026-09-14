@@ -1,5 +1,14 @@
 # dsh-web-recorder
 
+<p align="center">
+  <a href="https://www.npmjs.com/package/dsh-web-recorder"><img alt="npm" src="https://img.shields.io/npm/v/dsh-web-recorder?label=npm&color=cb3837"></a>
+  <a href="https://www.npmjs.com/package/dsh-web-recorder"><img alt="downloads" src="https://img.shields.io/npm/dm/dsh-web-recorder?label=downloads&color=brightgreen"></a>
+  <a href="https://github.com/kakajun/dsh-web-recorder/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/kakajun/dsh-web-recorder/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/kakajun/dsh-web-recorder/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/kakajun/dsh-web-recorder?style=social"></a>
+  <a href="https://github.com/kakajun/dsh-web-recorder/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/kakajun/dsh-web-recorder?label=License&color=yellow"></a>
+  <a href="https://dshfind.com/en/plugins/kakajun/dsh-web-recorder?ref=badge"><img alt="dshfind" src="https://dshfind.com/api/badge/kakajun/dsh-web-recorder"></a>
+</p>
+
 **语言：简体中文 · [English](README_EN.md)**
 
 ![dsh-web-recorder 封面](assets/podcast-cover.png)
@@ -253,3 +262,13 @@ pnpm smoke:wait    # 等待期(前置剔除)冒烟: 验证 waitSeconds 等待期
 - 请求头中的敏感头默认脱敏；请求体/响应体不做内容级脱敏（可能含 token 等业务数据），`events.jsonl` 应按敏感数据处理，不要外发。
 - 跨域 iframe 的 UI 事件依赖 init script 注入，极少数强 CSP 页面可能注入失败（网络事件不受影响）。
 - 点击接口请求后立即跳转页面时，浏览器会取消该响应体的抓取，此场景响应体可能缺失（事件仍在，只是无 body）。
+
+## 欢迎 PR 和 Issue
+
+插件还在持续打磨，任何形式的参与都欢迎：
+
+- **提 Issue**：[反馈问题或想法](https://github.com/kakajun/dsh-web-recorder/issues/new)——录不到的事件、attach 失败的场景、`report.md` 里缺的字段，都可以直接开 issue。附上日志与截图会更快定位；**请勿粘贴 `events.jsonl` 原文**（含完整请求头/请求体）。
+- **提 PR**：[fork 后提交合并请求](https://github.com/kakajun/dsh-web-recorder/pulls)——新增事件类型、改进报告呈现、补充冒烟用例或文档都欢迎。提交前建议跑 `pnpm typecheck && pnpm test`；改动了 `session.ts` 的事件采集逻辑，再跑一遍 `pnpm build && pnpm smoke`。
+- 顺手点个 [Star](https://github.com/kakajun/dsh-web-recorder/stargazers) 也是支持。
+
+想做但不确定合不合适的改动，欢迎先开 issue 聊一聊思路。
