@@ -78,13 +78,13 @@ jobs:
       - name: 构建产物
         run: pnpm build
 
-      - name: smoke: 新开窗口录制
+      - name: "smoke: 新开窗口录制"
         run: xvfb-run -a pnpm smoke
 
-      - name: smoke:wait: 等待期前置剔除
+      - name: "smoke:wait: 等待期前置剔除"
         run: xvfb-run -a pnpm smoke:wait
 
-      - name: smoke:cdp: CDP attach 录制
+      - name: "smoke:cdp: CDP attach 录制"
         run: xvfb-run -a pnpm smoke:cdp
 
       - name: 上传录制产物(失败时排障用)
