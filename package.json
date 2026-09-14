@@ -1,6 +1,6 @@
 {
   "name": "dsh-web-recorder",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Browser-recording tools for DSH: attaches over CDP to an already-open browser window (e.g. a Playwright MCP browser with a debugging port) or launches a headed browser, records real clicks, inputs, navigation and network requests in a user-guided session, then generates a Markdown operation-timeline report (report.md with redacted request/response bodies and asset list) for the model to analyze and reproduce.",
   "keywords": [
     "DSH",
@@ -42,7 +42,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-tools": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-tools": "v0.1.5-rc.2",
     "@deepseek-ai/schemastery": "^3.18.2",
     "@types/node": "^26.4.1",
     "tsdown": "^0.23.0",
@@ -50,8 +50,8 @@
     "vitest": "^5.0.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0",
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": ">=0.1.5-rc.1",
     "@deepseek-ai/schemastery": "^3.18.2"
   },
   "engines": {
