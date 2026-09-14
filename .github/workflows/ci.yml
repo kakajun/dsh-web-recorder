@@ -62,17 +62,21 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # RecorderSession 以 headless: false 启动有头窗口, Linux 无 X server 需 xvfb
-      - name: 安装 Chrome 与 xvfb
+      - name: 安装 xvfb 与 Chrome
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq xvfb
-          curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq google-chrome-stable
-
-      - name: Chrome 版本
-        run: google-chrome --version
+          # ubuntu-latest 镜像一般已预装 Google Chrome, 只有缺失时才装
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            # CI 无 tty: gpg 不加 --batch/--no-tty 会报 "cannot open '/dev/tty'"
+            curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+              | sudo gpg --batch --no-tty --yes --dearmor -o /usr/share/keyrings/google-chrome.gpg
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+              | sudo tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq google-chrome-stable
+          fi
+          google-chrome --version
 
       # 冒烟脚本直接 require lib/index.js, 必须先把源码构建到 lib/
       - name: 构建产物
