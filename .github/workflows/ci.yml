@@ -1,0 +1,97 @@
+name: CI
+
+# 提交/PR 即触发: 单元测试(report/stats 纯函数) + 类型检查 + 构建,
+# 再跑 tests/ 下的真实浏览器端到端冒烟(smoke / smoke:wait / smoke:cdp)。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: typecheck / vitest / build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 类型检查
+        run: pnpm typecheck
+
+      - name: 单元测试
+        run: pnpm test
+
+      - name: 构建产物
+        run: pnpm build
+
+  smoke:
+    name: 端到端冒烟 (headless-less Chrome + xvfb)
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      # 本机默认 msedge, CI 上装的是 Chrome: 冒烟脚本读该环境变量决定 channel
+      SMOKE_CHANNEL: chrome
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # RecorderSession 以 headless: false 启动有头窗口, Linux 无 X server 需 xvfb
+      - name: 安装 Chrome 与 xvfb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
+          curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq google-chrome-stable
+
+      - name: Chrome 版本
+        run: google-chrome --version
+
+      # 冒烟脚本直接 require lib/index.js, 必须先把源码构建到 lib/
+      - name: 构建产物
+        run: pnpm build
+
+      - name: smoke: 新开窗口录制
+        run: xvfb-run -a pnpm smoke
+
+      - name: smoke:wait: 等待期前置剔除
+        run: xvfb-run -a pnpm smoke:wait
+
+      - name: smoke:cdp: CDP attach 录制
+        run: xvfb-run -a pnpm smoke:cdp
+
+      - name: 上传录制产物(失败时排障用)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recorder-reports
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 7

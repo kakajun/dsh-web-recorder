@@ -112,6 +112,7 @@ assets/           README 截图与封面
 
 - **单元测试**（`pnpm test`）：vitest，直接运行 TS 源码无需构建。覆盖 `report.ts` 的 `generateMarkdown` 纯函数（`tests/report.test.ts`）与 `stats.ts` 的计数口径（`tests/stats.test.ts`）。
 - **端到端冒烟**（`pnpm smoke` / `pnpm smoke:cdp` / `pnpm smoke:mcp` / `pnpm smoke:wait`）：非测试框架的手工脚本，需要本机安装 Edge（或 Chrome）。前三者分别覆盖新开窗口录制、显式 cdpUrl attach、MCP 浏览器 CDP 端口自动发现 attach，`smoke:wait` 覆盖等待期（等待期内不记录、等待期后正常记录）；`smoke:cdp`/`smoke:mcp` 还断言 `stop` 后外部浏览器进程不被关闭。断言 `events.jsonl` 与 `report.md` 内容（点击/输入/请求/响应/脱敏）。
+- **CI**（`.github/workflows/ci.yml`）：push / PR 即触发 GitHub Actions。`test` job（ubuntu-latest + Node 22 + pnpm 10）跑 `install --frozen-lockfile` → `typecheck` → `test` → `build`；`smoke` job 安装 Chrome 与 xvfb（有头模式需要虚拟 X server，`SMOKE_CHANNEL=chrome`）跑 `smoke` / `smoke:wait` / `smoke:cdp`，失败时上传 `reports/` 产物。`smoke:mcp` 依赖 Windows 专用发现逻辑，不放 Linux CI。
 - 修改 `session.ts` 事件采集逻辑后，应跑 `pnpm build && pnpm smoke`（CDP 相关改动另跑 `pnpm smoke:cdp`）验证；修改 `report.ts` 至少跑 `pnpm test` + `pnpm typecheck`。
 
 ## 安全注意事项
