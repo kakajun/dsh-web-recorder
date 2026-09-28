@@ -103,8 +103,8 @@ export class RecorderSession {
   ): Promise<RecorderSession> {
     const now = new Date()
     const pad2 = (n: number): string => String(n).padStart(2, '0')
-    // 目录名 rec-HH-mm-ss: 本地时间时分秒, 简短易分辨
-    const dirName = `rec-${pad2(now.getHours())}-${pad2(now.getMinutes())}-${pad2(now.getSeconds())}`
+    // 目录名 rec_DD_HH-mm-ss: 本地"日" + 时分秒(日与时间之间用下划线分隔), 不含年月保持简短
+    const dirName = `rec_${pad2(now.getDate())}_${pad2(now.getHours())}-${pad2(now.getMinutes())}-${pad2(now.getSeconds())}`
     const session = new RecorderSession(opts, join(opts.outputDir, dirName))
     // 探测 MCP 浏览器的开销(spawn PowerShell CIM 查询)在一次启动内只付一次: attach 与接管共用探针
     const probe = createMcpBrowserProbe()

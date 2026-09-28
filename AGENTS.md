@@ -109,7 +109,7 @@ assets/           README 截图与封面
 - 启动中途失败要释放已建的浏览器与事件流；attach 失败同样要断开已建立的连接（`start` / `tryAttach` 的 catch 里处理）。
 - 保留 `console.log` 等调试输出，仅在明确要求时删除。
 - Node 版本由 fnm 管理（`D:\fnm\node-versions`，`fnm list` 查看）。
-- 运行时产物默认落在**当前工作目录**（harness 会话 cwd）下 `reports/recorder/rec-<HH-mm-ss>/`，该目录不可写时退回插件仓库根的 `reports/recorder`；`reports/` 已 gitignore。
+- 运行时产物默认落在**当前工作目录**（harness 会话 cwd）下 `reports/recorder/rec_<DD>_<HH-mm-ss>/`（本地「日」+ 时分秒，不含年月），该目录不可写时退回插件仓库根的 `reports/recorder`；`reports/` 已 gitignore。
 
 ## 测试策略
 
