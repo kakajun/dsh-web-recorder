@@ -11,6 +11,8 @@
 
 **语言：简体中文 · [English](README_EN.md)**
 
+> **宿主版本要求**：本插件适配 `@deepseek-ai/dsh` **`^0.2.0-rc.2`**（依赖其 `@deepseek-ai/dsh-tools@0.2.0-rc.2`），即 profile 的 `package.json` 需满足 `"@deepseek-ai/dsh": "^0.2.0-rc.2"`。
+
 ![dsh-web-recorder 封面](assets/podcast-cover.png)
 
 网页操作录制器插件：面向「用户手动操作浏览器，插件在后台录制」的场景。它可以 attach 到已打开的浏览器窗口（如带调试端口的 Playwright MCP 浏览器，**这个是可选的**），也可以自己启动一个有头浏览器窗口（默认本机 Edge）；用户在窗口里正常点网页，插件在后台记录每次点击 / 输入 / 表单提交和每个网络请求 / 响应 / 失败，停止后生成 Markdown 摘要报告。
@@ -46,7 +48,7 @@
 
 ## 🚀 安装
 
-**前置**：已装好 DSH（`dsh web` 能正常运行），Node.js ≥ 18、pnpm ≥ 8。
+**前置**：已装好 DSH（`dsh web` 能正常运行，`@deepseek-ai/dsh` 需为 `^0.2.0-rc.2`），Node.js ≥ 18、pnpm ≥ 8。
 
 ```sh
 dsh plugin --profile web add dsh-web-recorder@latest

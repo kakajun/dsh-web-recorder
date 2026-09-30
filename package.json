@@ -38,21 +38,21 @@
     "smoke:wait": "node tests/smoke-wait.mjs"
   },
   "dependencies": {
-    "playwright-core": "^1.49.1"
+    "playwright-core": "^1.63.0"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-tools": "v0.1.7-rc.2",
-    "@deepseek-ai/schemastery": "^3.18.2",
-    "@types/node": "^26.4.1",
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-tools": "v0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "@types/node": "^26.6.3",
     "tsdown": "^0.23.0",
-    "typescript": "^5.9.3",
-    "vitest": "^5.0.0"
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-tools": ">=0.1.7-rc.2",
-    "@deepseek-ai/schemastery": "^3.18.2"
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.4"
   },
   "engines": {
     "node": ">=18"

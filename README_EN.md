@@ -11,6 +11,8 @@
 
 **Languages: English · [简体中文](README.md)**
 
+> **Host version requirement**: this plugin targets `@deepseek-ai/dsh` **`^0.2.0-rc.2`** (it depends on `@deepseek-ai/dsh-tools@0.2.0-rc.2`), i.e. the profile's `package.json` must satisfy `"@deepseek-ai/dsh": "^0.2.0-rc.2"`.
+
 A browser-operation recorder plugin for DSH. It targets the scenario where a human drives the browser while the plugin records in the background: it can attach to an already-open browser window (e.g. a Playwright MCP browser with a debugging port — **this is optional**), or launch its own headed browser window (the local Edge by default); as you interact with pages normally, the plugin records every click / input / form submission and every network request / response / failure, then generates a Markdown summary report when recording stops.
 
 ## Why this plugin exists (design intent)
