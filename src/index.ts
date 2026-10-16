@@ -35,6 +35,7 @@ const RECORDER_DEFAULTS = {
   channel: 'msedge',
   executablePath: '',
   cdpUrl: '',
+  userDataDir: '',
   outputDir: '',
   captureResponseBodies: true,
   maxBodyBytes: 16384,
@@ -52,6 +53,9 @@ export const Config = z.object({
   // CDP 调试地址(如 http://127.0.0.1:9222), 非空时优先 attach 到已有浏览器;
   // 留空也会自动发现带 CDP 端口的 Playwright MCP 浏览器并 attach
   cdpUrl: z.string().default(RECORDER_DEFAULTS.cdpUrl),
+  // 自启窗口使用的浏览器 profile 目录; 为空时默认 ~/.dsh-web-recorder/browser-profile。
+  // 持久化 profile 让登录态跨次录制保留(目标站只需登录一次), 并让插件窗口自身暴露 CDP 端口
+  userDataDir: z.string().default(RECORDER_DEFAULTS.userDataDir),
   // 录制产物输出根目录; 为空时默认当前工作目录(用户正在操作的文件夹)下 reports/recorder
   outputDir: z.string().default(RECORDER_DEFAULTS.outputDir),
   captureResponseBodies: z.boolean().default(RECORDER_DEFAULTS.captureResponseBodies),
@@ -68,6 +72,7 @@ interface RecorderConfig {
   channel?: string
   executablePath?: string
   cdpUrl?: string
+  userDataDir?: string
   outputDir?: string
   captureResponseBodies?: boolean
   maxBodyBytes?: number
@@ -108,6 +113,15 @@ type StartSuccess = {
   attached: boolean
   initialUrl?: string
   waitSeconds?: number
+  /**
+   * 本次录制所用浏览器窗口的 CDP 地址。驱动方(playwright MCP / browser-use / 自己的脚本)
+   * 可据此 connectOverCDP 连上同一个窗口继续操作, 不必反过来要求用户预配 MCP 调试端口。
+   */
+  cdpUrl?: string
+  /** 自启窗口的持久化 profile 目录(登录态跨次录制保留) */
+  profileDir?: string
+  /** profile 退回临时目录时的原因(profile 被占用等); 正常时不存在 */
+  profileFallback?: string
   /** 本次录制在宿主后台任务运行时里的 id(如 recorder-1); 宿主未提供该能力时不存在 */
   jobId?: string
   hint: string
@@ -228,6 +242,10 @@ type StatusSuccess = {
   recording: boolean
   startedAt?: number
   sessionDir?: string
+  /** 本次录制所用浏览器窗口的 CDP 地址(驱动方可据此连上同一窗口) */
+  cdpUrl?: string
+  /** 自启窗口的持久化 profile 目录(登录态保留) */
+  profileDir?: string
   eventCount?: number
   counts?: SessionStats
   waitSeconds?: number
@@ -243,6 +261,7 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
     channel: config?.channel ?? RECORDER_DEFAULTS.channel,
     executablePath: config?.executablePath ?? RECORDER_DEFAULTS.executablePath,
     cdpUrl: config?.cdpUrl ?? RECORDER_DEFAULTS.cdpUrl,
+    userDataDir: config?.userDataDir?.trim() ?? RECORDER_DEFAULTS.userDataDir,
     outputDir,
     captureResponseBodies: config?.captureResponseBodies ?? RECORDER_DEFAULTS.captureResponseBodies,
     maxBodyBytes: config?.maxBodyBytes ?? RECORDER_DEFAULTS.maxBodyBytes,
@@ -319,6 +338,13 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
               type: 'number',
               description: '等待多少秒后开始记录(0 表示立即开始); 等待期内的事件不记录'
             },
+            cdpUrl: {
+              type: 'string',
+              description:
+                '本次录制所用浏览器窗口的 CDP 地址; 驱动方可用它 connectOverCDP 连上同一窗口继续操作'
+            },
+            profileDir: { type: 'string', description: '自启窗口的持久化 profile 目录(登录态保留)' },
+            profileFallback: { type: 'string', description: 'profile 退回临时目录的原因(正常时不存在)' },
             jobId: {
               type: 'string',
               description: '本次录制的后台任务 id(宿主提供该能力时存在); 完成时你会收到通知'
@@ -341,22 +367,39 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
               }
             ]
           }
-          return [
-            {
-              type: 'text',
-              text:
-                `录制已开始${value.attached ? `(已 attach 到正在运行的浏览器窗口${opts.cdpUrl ? `: ${opts.cdpUrl}` : ''})` : ', 新的浏览器窗口已打开'}${value.initialUrl ? `并导航到 ${value.initialUrl}` : ''}。\n` +
-                `产物目录: ${value.sessionDir}\n` +
-                (value.waitSeconds && value.waitSeconds > 0
-                  ? `前 ${value.waitSeconds}s 为等待期(期间的操作与请求不记录), 请在这段时间内完成登录 / 等页面加载完成。\n`
-                  : '') +
-                `请用户在浏览器中手动操作。\n` +
-                (value.jobId
-                  ? `本次录制已登记为后台任务 ${value.jobId}: 用户操作完或直接关掉浏览器后, 你会收到任务完成通知;` +
-                    `届时用 job_output 取回产物路径与统计, 再读 report.md 总结。不要轮询 recorder_status。`
-                  : `完成后调用 recorder_stop 生成报告并总结。`)
-            }
+          const lines = [
+            `录制已开始${
+              value.attached
+                ? `(已 attach 到正在运行的浏览器窗口${opts.cdpUrl ? `: ${opts.cdpUrl}` : ''})`
+                : ', 新的浏览器窗口已打开'
+            }${value.initialUrl ? `并导航到 ${value.initialUrl}` : ''}。`,
+            `产物目录: ${value.sessionDir}`
           ]
+          if (value.waitSeconds && value.waitSeconds > 0) {
+            lines.push(
+              `前 ${value.waitSeconds}s 为等待期(期间的操作与请求不记录), 请在这段时间内完成登录 / 等页面加载完成。`
+            )
+          }
+          lines.push('请用户在浏览器中手动操作。')
+          if (value.profileDir) {
+            lines.push(`浏览器 profile: ${value.profileDir}(登录态保留, 下次录制仍是已登录状态)。`)
+          }
+          if (value.profileFallback) {
+            lines.push(`提示: 持久 profile 不可用, 本次已改用临时 profile(${value.profileFallback})。`)
+          }
+          if (value.cdpUrl) {
+            lines.push(
+              `本窗口已暴露 CDP: ${value.cdpUrl} —— 若要让 playwright MCP / 其他自动化工具在这个窗口里继续操作, ` +
+                '可直接连它(playwright MCP 加 --cdp-endpoint=<该地址>, playwright-core 用 chromium.connectOverCDP); ' +
+                '本插件只负责录制, 不代为操作。'
+            )
+          }
+          lines.push(
+            value.jobId
+              ? `本次录制已登记为后台任务 ${value.jobId}: 用户操作完或直接关掉浏览器后, 你会收到任务完成通知; 届时用 job_output 取回产物路径与统计, 再读 report.md 总结。不要轮询 recorder_status。`
+              : '完成后调用 recorder_stop 生成报告并总结。'
+          )
+          return [{ type: 'text', text: lines.join('\n') }]
         }
       },
       async execute(args, exec): Promise<StartResult> {
@@ -407,6 +450,9 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           exec.agent,
           `网页操作录制${url ? `: ${url}` : ''}`
         )
+        const cdpUrl = session.cdpUrl()
+        const profileDir = session.profileDirectory()
+        const profileFallback = session.profileFallback()
         return {
           ok: true,
           sessionDir: session.sessionDir,
@@ -414,6 +460,9 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           attached: session.isAttached(),
           ...(url ? { initialUrl: url } : {}),
           ...(waitSeconds > 0 ? { waitSeconds } : {}),
+          ...(cdpUrl ? { cdpUrl } : {}),
+          ...(profileDir ? { profileDir } : {}),
+          ...(profileFallback ? { profileFallback } : {}),
           ...(currentJobId ? { jobId: currentJobId } : {}),
           hint: currentJobId
             ? waitSeconds > 0
@@ -508,7 +557,8 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
     defineTool({
       name: 'recorder_status',
       description:
-        '查询网页操作录制的当前状态: 是否在录制中、已记录事件计数、产物目录、上一次录制的收尾结果。',
+        '查询网页操作录制的当前状态: 是否在录制中、已记录事件计数、产物目录、' +
+        '本次录制窗口的 CDP 地址、上一次录制的收尾结果。',
       parameters: {},
       output: {
         schema: {
@@ -519,6 +569,8 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
             recording: { type: 'boolean', required: true, description: '是否正在录制' },
             startedAt: { type: 'number', description: '开始时间戳(录制中时存在)' },
             sessionDir: { type: 'string', description: '产物目录(录制中时存在)' },
+            cdpUrl: { type: 'string', description: '本次录制窗口的 CDP 地址(驱动方可连上同一窗口)' },
+            profileDir: { type: 'string', description: '自启窗口的持久化 profile 目录' },
             eventCount: { type: 'number', description: '已记录事件数(录制中时存在)' },
             counts: {
               type: 'object',
@@ -545,6 +597,8 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
                     ? `仍在等待期(共 ${value.waitSeconds}s, 还剩 ${value.waitRemainingSec}s), 此期间操作不记录。\n`
                     : '') +
                   `产物目录: ${value.sessionDir}` +
+                  (value.cdpUrl ? `\n窗口 CDP: ${value.cdpUrl}(驱动方可连上同一个窗口)` : '') +
+                  (value.profileDir ? `\n浏览器 profile: ${value.profileDir}` : '') +
                   (value.jobId ? `\n后台任务: ${value.jobId}(录制结束会自动通知你)` : '')
               }
             ]
@@ -572,6 +626,8 @@ export function apply(ctx: Context, config?: RecorderConfig): void {
           recording: true,
           startedAt: s.startedAt,
           sessionDir: s.sessionDir,
+          ...(s.cdpUrl ? { cdpUrl: s.cdpUrl } : {}),
+          ...(s.profileDir ? { profileDir: s.profileDir } : {}),
           eventCount: s.eventCount,
           counts: s.counts,
           waitSeconds: s.waitSeconds,

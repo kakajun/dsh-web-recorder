@@ -1,17 +1,25 @@
 /**
- * Playwright MCP 浏览器的发现与接管(Windows 专用实现)。
+ * 本机 Chromium 浏览器的 CDP 发现与接管(Windows 专用实现)。
  *
  * 用途: recorder 想「接管用户正在使用的浏览器」而不是另开窗口时, 需要定位那个浏览器实例:
- *   1. 经 PowerShell CIM 查进程命令行, 找到带 ms-playwright-mcp user-data-dir 的 chrome/msedge;
- *   2. 该 user-data-dir 下的 DevToolsActivePort 第一行即 CDP 端口(MCP 以 --remote-debugging-port 启动时写入),
- *      据此可直接 attach 到用户正在看的窗口;
- *   3. 没有调试端口时只能走接管: 从 Chrome Sessions 的 Tabs 文件里取最近访问的 URL, 关掉 MCP 浏览器,
+ *   1. 经 PowerShell CIM 查进程命令行, 找出所有**开启了远程调试端口**的 chrome/msedge 顶层进程
+ *      (即命令行含 --remote-debugging-port 且非 --type= 子进程);
+ *   2. 端口取值: 命令行里写了具体端口就直接用; 写的是 0(让 Chrome 自选)则读该 user-data-dir 下的
+ *      DevToolsActivePort 第一行 —— MCP 与插件自启窗口都是这种写法;
+ *   3. 据此可直接 attach 到用户正在看的窗口, 无需任何配置;
+ *   4. 若目标浏览器**没有**开调试端口(如 MCP 未配 --remote-debugging-port), 则无法 attach;
+ *      此时走接管回退: 从 Chrome Sessions 的 Tabs 文件里取最近访问的 URL, 关掉它,
  *      再用 recorder 自启窗口打开同一 URL。
  *
- * 非 Windows 平台不做实现: 这些手段(PowerShell CIM / Chrome Tabs 文件布局)都不适用,
- * 直接返回 undefined 让调用方回退到「新开窗口」, 省掉注定失败的子进程调用。
+ * 为什么扫描范围不限于 Playwright MCP: 「零配置接入」的前提是「谁开了调试端口就接管谁」。
+ * 用户手工 `chrome --remote-debugging-port=9222` 起的浏览器、chrome-devtools MCP、
+ * Playwright MCP 配置了调试端口的浏览器, 都属于「用户正在用的窗口」, 都应当能直接 attach。
+ * MCP 特征的浏览器(命令行含 ms-playwright-mcp)排在候选列表最前, 因为它是本插件最主要的协作对象。
  *
- * 探针对象在同一次 RecorderSession.start() 内复用: user-data-dir 的查询要 spawn 一次 PowerShell
+ * 非 Windows 平台不做实现: 这些手段(PowerShell CIM / Chrome Tabs 文件布局)都不适用,
+ * 直接返回空让调用方回退到「新开窗口」, 省掉注定失败的子进程调用。
+ *
+ * 探针对象在同一次 RecorderSession.start() 内复用: 进程扫描要 spawn 一次 PowerShell
  * (CIM 查询偏慢), 发现 CDP 与接管两条路径共用缓存, 一次启动最多查一次。
  */
 import { execSync } from 'node:child_process'
@@ -20,13 +28,27 @@ import { join } from 'node:path'
 
 const IS_WIN32 = process.platform === 'win32'
 
+/** 一个暴露了 CDP 端口的本机 Chromium 浏览器。 */
+export interface CdpBrowser {
+  pid: number
+  /** 可直接用于 connectOverCDP 的地址 */
+  cdpUrl: string
+  /** 是否为 Playwright MCP 启动的浏览器(排序优先) */
+  isMcp: boolean
+  userDataDir?: string
+}
+
 /**
  * 执行 PowerShell 脚本并返回 stdout。统一走 -EncodedCommand(UTF-16LE base64):
  * 脚本内含双引号(如正则 [^\s"])时, -Command "..." 经 cmd.exe + powershell 双层引号
  * 解析会断裂静默失败, EncodedCommand 完全绕开该问题。
  */
 function runPowerShell(script: string): string {
-  const encoded = Buffer.from(script, 'utf16le').toString('base64')
+  // 抑制「正在准备首次使用模块」等进度记录: 它们会被 PowerShell 以 CLIXML 形式写进 stderr,
+  // 污染宿主终端输出(录制本身不受影响, 但看起来像报错)
+  const encoded = Buffer.from(`$ProgressPreference='SilentlyContinue'\n${script}`, 'utf16le').toString(
+    'base64'
+  )
   return execSync(`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`, {
     encoding: 'utf8',
     timeout: 10000
@@ -38,27 +60,72 @@ const sleep = (ms: number): Promise<void> =>
     setTimeout(resolve, ms)
   })
 
-/** 查找正在运行的 Playwright MCP 浏览器的 user-data-dir(Windows: PowerShell CIM 查进程命令行)。 */
-function queryMcpUserDataDir(): string | undefined {
-  if (!IS_WIN32) return undefined
+/** 命令行中 --flag=value 形式参数的取值(处理可选的双引号包裹)。 */
+function argValue(commandLine: string, flag: string): string | undefined {
+  const matched = commandLine.match(new RegExp(`--${flag}=(?:"([^"]+)"|(\\S+))`))
+  return matched ? (matched[1] ?? matched[2]) : undefined
+}
+
+/** 从 user-data-dir 下的 DevToolsActivePort 读实际 CDP 端口(Chrome 自选端口时唯一可靠来源)。 */
+function portFromDevToolsFile(userDataDir: string | undefined): number | undefined {
+  if (!userDataDir) return undefined
   try {
-    const psScript = `
-      Get-CimInstance Win32_Process | Where-Object {
-        ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') -and
-        $_.CommandLine -match 'ms-playwright-mcp' -and
-        $_.CommandLine -notmatch '--type='
-      } | ForEach-Object {
-        if ($_.CommandLine -match '--user-data-dir="?([^\\s"]+)') { $Matches[1] }
-      } | Select-Object -First 1
-    `
-    const userDataDir = runPowerShell(psScript).trim()
-    return userDataDir || undefined
+    const portFile = join(userDataDir, 'DevToolsActivePort')
+    if (!existsSync(portFile)) return undefined
+    const port = Number(readFileSync(portFile, 'utf8').split('\n')[0]?.trim())
+    return Number.isInteger(port) && port > 0 ? port : undefined
   } catch {
     return undefined
   }
 }
 
-/** 关闭 Playwright MCP 浏览器进程(通过 PowerShell Stop-Process)。 */
+/**
+ * 扫描本机所有「开了远程调试端口」的 Chromium 浏览器。
+ * 一次 PowerShell 调用取全部候选(避免每个进程各 spawn 一次)。
+ */
+function scanCdpBrowsers(): CdpBrowser[] {
+  if (!IS_WIN32) return []
+  try {
+    const psScript = `
+      [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+      $items = @(Get-CimInstance Win32_Process | Where-Object {
+        ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') -and
+        $_.CommandLine -like '*--remote-debugging-port=*' -and
+        $_.CommandLine -notlike '*--type=*'
+      } | Select-Object ProcessId, CommandLine)
+      if ($items.Count -gt 0) { $items | ConvertTo-Json -Compress -Depth 3 }
+    `
+    const raw = runPowerShell(psScript).trim()
+    if (!raw) return []
+    const parsed: unknown = JSON.parse(raw)
+    const rows = (Array.isArray(parsed) ? parsed : [parsed]) as {
+      ProcessId?: number
+      CommandLine?: string | null
+    }[]
+    const found: CdpBrowser[] = []
+    for (const row of rows) {
+      const commandLine = row.CommandLine ?? ''
+      if (!commandLine) continue
+      const userDataDir = argValue(commandLine, 'user-data-dir')
+      const declared = Number(argValue(commandLine, 'remote-debugging-port'))
+      // 端口为 0 表示 Chrome 自选: 实际端口写在 user-data-dir/DevToolsActivePort
+      const port = Number.isInteger(declared) && declared > 0 ? declared : portFromDevToolsFile(userDataDir)
+      if (!port) continue
+      found.push({
+        pid: row.ProcessId ?? 0,
+        cdpUrl: `http://127.0.0.1:${port}`,
+        isMcp: /ms-playwright-mcp/i.test(commandLine),
+        ...(userDataDir ? { userDataDir } : {})
+      })
+    }
+    // MCP 浏览器优先(本插件最主要的协作对象), 其余按 pid 降序(通常越新启动的越相关)
+    return found.sort((a, b) => Number(b.isMcp) - Number(a.isMcp) || b.pid - a.pid)
+  } catch {
+    return []
+  }
+}
+
+/** 关闭 Playwright MCP 浏览器进程(通过 PowerShell Stop-Process)。只认 MCP 特征进程, 不动用户自己的浏览器。 */
 function killMcpBrowser(): void {
   if (!IS_WIN32) return
   try {
@@ -127,10 +194,10 @@ function extractUrlFromTabs(userDataDir: string): string | undefined {
   }
 }
 
-export interface McpBrowserProbe {
-  /** MCP 浏览器的 user-data-dir; 结果在探针内缓存, 查不到返回 undefined。 */
-  findUserDataDir(): string | undefined
-  /** CDP 调试地址(MCP 以 --remote-debugging-port 启动时才有), 供 connectOverCDP attach。 */
+export interface BrowserProbe {
+  /** 本机所有暴露 CDP 端口的 Chromium 浏览器(MCP 特征优先); 结果在探针内缓存。 */
+  cdpBrowsers(): CdpBrowser[]
+  /** 首个可 attach 的 CDP 地址; 没有则返回 undefined。 */
   discoverCdpUrl(): string | undefined
   /** 最近访问的 URL; 检测不到 MCP 浏览器时返回 undefined(接管回退用)。 */
   lastVisitedUrl(): string | undefined
@@ -138,42 +205,31 @@ export interface McpBrowserProbe {
   closeAndWait(timeoutMs?: number): Promise<void>
 }
 
-export function createMcpBrowserProbe(): McpBrowserProbe {
-  let cachedDir: string | undefined
-  let dirQueried = false
+export function createBrowserProbe(): BrowserProbe {
+  let cached: CdpBrowser[] | undefined
 
-  const findUserDataDir = (): string | undefined => {
-    if (dirQueried) return cachedDir
-    dirQueried = true
-    cachedDir = queryMcpUserDataDir()
-    return cachedDir
+  const cdpBrowsers = (): CdpBrowser[] => {
+    cached ??= scanCdpBrowsers()
+    return cached
   }
 
   const invalidate = (): void => {
-    dirQueried = false
-    cachedDir = undefined
+    cached = undefined
   }
 
+  /** 接管回退只针对 MCP 浏览器(唯一的 user-data-dir 缓存来源)。 */
+  const mcpUserDataDir = (): string | undefined =>
+    cdpBrowsers().find(b => b.isMcp)?.userDataDir ?? queryMcpUserDataDir()
+
   return {
-    findUserDataDir,
+    cdpBrowsers,
 
     discoverCdpUrl(): string | undefined {
-      try {
-        const userDataDir = findUserDataDir()
-        if (!userDataDir) return undefined
-        // Chrome 把实际端口写入 user-data-dir 下的 DevToolsActivePort(第一行)
-        const portFile = join(userDataDir, 'DevToolsActivePort')
-        if (!existsSync(portFile)) return undefined
-        const port = Number(readFileSync(portFile, 'utf8').split('\n')[0]?.trim())
-        if (!Number.isInteger(port) || port <= 0) return undefined
-        return `http://127.0.0.1:${port}`
-      } catch {
-        return undefined
-      }
+      return cdpBrowsers()[0]?.cdpUrl
     },
 
     lastVisitedUrl(): string | undefined {
-      const userDataDir = findUserDataDir()
+      const userDataDir = mcpUserDataDir()
       if (!userDataDir) return undefined
       return extractUrlFromTabs(userDataDir)
     },
@@ -184,10 +240,28 @@ export function createMcpBrowserProbe(): McpBrowserProbe {
       const deadline = Date.now() + timeoutMs
       while (Date.now() < deadline) {
         await sleep(400)
-        invalidate()
-        // 进程已退出则查不到 user-data-dir, 认为接管完成
         if (!queryMcpUserDataDir()) return
       }
     }
+  }
+}
+
+/** 查询 Playwright MCP 浏览器的 user-data-dir(接管回退时定位其 profile 读最近 URL / 等进程退出)。 */
+function queryMcpUserDataDir(): string | undefined {
+  if (!IS_WIN32) return undefined
+  try {
+    const psScript = `
+      Get-CimInstance Win32_Process | Where-Object {
+        ($_.Name -eq 'chrome.exe' -or $_.Name -eq 'msedge.exe') -and
+        $_.CommandLine -match 'ms-playwright-mcp' -and
+        $_.CommandLine -notmatch '--type='
+      } | ForEach-Object {
+        if ($_.CommandLine -match '--user-data-dir="?([^\\s"]+)') { $Matches[1] }
+      } | Select-Object -First 1
+    `
+    const userDataDir = runPowerShell(psScript).trim()
+    return userDataDir || undefined
+  } catch {
+    return undefined
   }
 }

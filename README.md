@@ -107,9 +107,9 @@ dsh plugin --profile web add dsh-web-recorder@latest
 
 | 工具                   | 说明                                                                    |
 | ---------------------- | ----------------------------------------------------------------------- |
-| `recorder_start(url?, waitSeconds?)` | 开始录制：优先 attach 到已有浏览器窗口（`cdpUrl` / 自动发现带调试端口的 Playwright MCP 浏览器），否则启动有头浏览器并可导航到起始 URL；`waitSeconds` 可让录制先等 N 秒再记录（跳过登录 / 初始化）；事件实时落盘 `events.jsonl`。返回时会把本次录制登记为后台任务并返回 `jobId` |
-| `recorder_stop()`      | 停止录制：生成 `report.md` 摘要报告；attach 模式只断开 CDP 连接，插件自启的窗口才关闭；幂等       |
-| `recorder_status()`    | 查询状态：是否在录制、事件分类计数、产物目录、`jobId`、上一次收尾结果            |
+| `recorder_start(url?, waitSeconds?)` | 开始录制：优先 attach 到已有浏览器窗口（`cdpUrl` / 自动发现**本机任何开了调试端口的 Chromium**，Playwright MCP 优先），否则启动有头浏览器并可导航到起始 URL。自启窗口**自带 CDP 调试端口**并在返回里给出 `cdpUrl`，驱动方可直接连上来接管这个窗口。`waitSeconds` 可让录制先等 N 秒再记录（跳过登录 / 初始化）；事件实时落盘 `events.jsonl`。返回时会把本次录制登记为后台任务并返回 `jobId` |
+| `recorder_stop()`      | 停止录制：生成 `report.md` 摘要报告；attach 模式**只断开录制连接、不关闭外部浏览器**，插件自启的窗口才关闭；幂等       |
+| `recorder_status()`    | 查询状态：是否在录制、事件分类计数、产物目录、本次录制窗口的 CDP 地址、`jobId`、上一次收尾结果 |
 
 用户直接关掉浏览器窗口会自动收尾（`reason: browser-closed`），已录数据不丢。
 
@@ -153,10 +153,30 @@ dsh plugin --profile web add dsh-web-recorder@latest
 5. **收尾**：`recorder_stop()`——生成 `report.md` 摘要报告（attach 模式只断开 CDP 连接，不关闭外部浏览器；插件自启的窗口会关闭；用户直接关窗口也会自动收尾）。录完可以什么都不做直接关窗口：后台任务会结算并通知模型
 6. **分析沉淀**：模型收到后台任务完成通知后读取 `report.md` + `events.jsonl`，归纳「流程步骤 × 接口调用 × 请求/响应契约」，进一步沉淀为 skill 或接口对接文档
 
+### 零配置接入：不必再手改 MCP 配置
+
+以前要让「浏览器自动化工具」和录制器共用同一个窗口，得先给 playwright MCP 加 `--remote-debugging-port`（要写一份 `playwright-mcp.config.json`）。现在这步可以省掉了：
+
+**① 谁开了调试端口就接管谁**——自动发现的范围已从「只认 Playwright MCP」扩展为「本机任何带 `--remote-debugging-port` 的 Chromium」：`chrome --remote-debugging-port=9222` 手工起的浏览器、chrome-devtools MCP 的、其他工具开的，都能被自动 attach。端口写成 `0`（让 Chrome 自选）时，会去读该 user-data-dir 下的 `DevToolsActivePort` 拿实际端口。Playwright MCP 的浏览器优先级最高。
+
+**② 插件自己开的窗口也能被连**——自启窗口现在固定带 `--remote-debugging-port=0`，`recorder_start` 的返回里会带上它的 CDP 地址（`cdpUrl`）。要让驱动方在这个窗口里继续操作，直接连这个地址即可：
+
+| 驱动方 | 怎么连 |
+| --- | --- |
+| playwright MCP | 启动 MCP 时加 `--cdp-endpoint=<cdpUrl>` |
+| browser-use | `BrowserSession(cdp_url=<cdpUrl>)` |
+| 自己的 playwright-core 脚本 | `chromium.connectOverCDP(cdpUrl)` |
+
+于是「先让 MCP 打开页面、再起录」不再是唯一路径——**反过来**也成立：录制器先开窗口（`recorder_start`），把 `cdpUrl` 交给驱动方连上来操作，同样录得到。
+
+**③ 登录态只付一次**——自启窗口使用**持久化 profile**（默认 `~/.dsh-web-recorder/browser-profile`，可用 Config 的 `userDataDir` 改）。目标站登录一次，之后每次录制都直接是已登录状态，顺带省掉「登录跳转」那批噪音请求。持久 profile 被残留进程占用而启动失败时会自动改用临时 profile，不影响录制。
+
+> attach 模式下 `recorder_stop` **只断开录制连接，不会关闭外部浏览器**（MCP 会话与用户手上那个窗口都照常可用）；这一条在 `pnpm smoke:cdp` / `pnpm smoke:mcp` 里作为断言校验。
+
 ### 协同前提（重要）
 
 - **playwright MCP 是可选的，不是前置依赖**：没装它、也没装 browser-use，插件照样能录——真人在插件弹出的窗口里手动操作一遍即可（这也是最常见的用法）。MCP / browser-use 只是把「打开页面 + 按步骤操作」自动化的可选项。
-- **唯一「不能在 playwright MCP 已打开的浏览器上继续操作」的场景**：MCP 的浏览器**没有**带 `--remote-debugging-port`。此时录制器无法 attach 上去，只能走「接管」回退——记下 MCP 浏览器当前页面 URL 后**把 MCP 浏览器进程关掉**，再用插件自启窗口打开同一页面；此后 MCP 与原来那个浏览器的连接已经断了，无法再驱动它（MCP 若重新开一个窗口，那个新窗口同样不在录制范围内）。想让 MCP 与录制器共存、MCP 继续在受录制的窗口里操作，就必须给 MCP 浏览器加调试端口（或用显式 `cdpUrl` 指向它）。
+- **唯一「不能在 playwright MCP 已打开的浏览器上继续操作」的场景**：MCP 的浏览器**没有**带 `--remote-debugging-port`。此时录制器无法 attach 上去，只能走「接管」回退——记下 MCP 浏览器当前页面 URL 后**把 MCP 浏览器进程关掉**，再用插件自启窗口打开同一页面；此后 MCP 与原来那个浏览器的连接已经断了，无法再驱动它（MCP 若重新开一个窗口，那个新窗口同样不在录制范围内）。想让 MCP 与录制器共存有两条路：让 **MCP 浏览器带调试端口**（或用显式 `cdpUrl` 指向它），录制器 attach 过去；或者**反过来**——接管回退后插件自启的窗口自带 CDP 端口（返回里的 `cdpUrl`），让 MCP 以 `--cdp-endpoint=<cdpUrl>` 连到这个新窗口继续操作。
 - 录制范围是**插件 attach / 启动的那个浏览器窗口**（含其新标签页与 iframe）；驱动方（真人或自动化工具）的操作必须发生在**这个窗口里**才会被录到。
 - **与 playwright MCP 共用同一个浏览器窗口**：让 MCP 启动浏览器时带上远程调试端口，记录仪即可自动 attach。给 `@playwright/mcp` 传一个配置文件（`--config=path/to/playwright-mcp.config.json`），内容为：
   ```json
@@ -176,7 +196,7 @@ dsh plugin --profile web add dsh-web-recorder@latest
 - 本机需装有浏览器：默认用 Edge（`channel: msedge`），可配 `chrome` 或 `executablePath`；插件不下载浏览器
 - **不强制要求 playwright MCP**：驱动方可以是真人（在插件弹出的窗口里操作），也可以是 playwright MCP / browser-use 等自动化工具；两者都没有时，插件自己打开窗口，由真人操作即可
 - 配置 `cdpUrl` 或 MCP 浏览器带 `--remote-debugging-port` 时，记录仪优先通过 Chrome DevTools Protocol attach 到已有浏览器实例；attach 失败会回退到接管/新开窗口
-- CDP attach 模式下，`recorder_stop` 不会关闭外部浏览器进程，仅断开录制连接；普通模式（未 attach）下结束会关闭插件自启的窗口
+- CDP attach 模式下，`recorder_stop` 不会关闭外部浏览器进程，仅断开录制连接（`pnpm smoke:cdp` / `pnpm smoke:mcp` 会校验进程与页面都还在）；普通模式（未 attach）下结束会关闭插件自启的窗口
 - `events.jsonl` 含请求头/请求体/响应体等完整数据，按敏感数据处理，勿外发
 
 ### 初始化请求噪音：直接打开页面会多录一批接口（已实测确认）
@@ -229,6 +249,7 @@ recorder_start({ url: "https://目标地址/login", waitSeconds: 10 })
 | `channel`               | `msedge`                                                        | playwright-core 浏览器渠道（`msedge`/`chrome`），使用本机已装浏览器，不下载 Chromium                                     |
 | `executablePath`        | `''`                                                            | 自定义浏览器可执行文件路径，非空时覆盖 `channel`                                                                         |
 | `cdpUrl`                | `''`                                                            | CDP 调试地址（如 `http://127.0.0.1:9222`），非空时优先 attach 到已有浏览器；留空时自动发现带 CDP 端口的 Playwright MCP 浏览器；都失败则回退到接管/新开窗口 |
+| `userDataDir`           | `''`                                                            | 自启窗口使用的浏览器 profile 目录；空则默认 `~/.dsh-web-recorder/browser-profile`。持久化 profile 让登录态跨次录制保留（目标站只需登录一次），并让插件窗口自身暴露 CDP 端口供驱动方连接 |
 | `outputDir`             | `''`                                                            | 产物输出根目录；空则默认当前工作目录（用户正在操作的文件夹，harness 会话 cwd）下 `reports/recorder` |
 | `captureResponseBodies` | `true`                                                          | 是否抓取 xhr/fetch 响应体                                                                                                |
 | `maxBodyBytes`          | `16384`                                                         | 单个请求体/响应体最大记录字节数，超出截断                                                                                |
@@ -260,8 +281,8 @@ pnpm smoke:wait    # 等待期(前置剔除)冒烟: 验证 waitSeconds 等待期
 
 ## 已知限制
 
-- 只录制插件 attach / 自己启动的浏览器窗口（含其新标签页 / iframe），无法录制其他浏览器实例里的操作。要让 playwright MCP / browser-use 等自动化工具的操作被录到，需让它们驱动与记录仪相同的浏览器实例：MCP 以 `--remote-debugging-port` 启动时记录仪会自动 CDP attach（见「协同前提」），未开启调试端口的 MCP 浏览器只能走接管回退（关掉 MCP 浏览器、开插件自启窗口，此后 MCP 无法再驱动原来那个窗口）。
-- playwright MCP / browser-use 都不是必需依赖（真人操作即可），但接管回退模式下 MCP 浏览器会被关闭，之后只能由真人在插件自启窗口里继续操作。
+- 只录制插件 attach / 自己启动的浏览器窗口（含其新标签页 / iframe），无法录制其他浏览器实例里的操作。要让 playwright MCP / browser-use 等自动化工具的操作被录到，需让它们驱动与记录仪相同的浏览器实例：浏览器带 `--remote-debugging-port` 时记录仪会自动 CDP attach（见「协同前提」），插件自启的窗口同样自带 CDP 端口、可反过来让驱动方连上来（见「零配置接入」）。
+- playwright MCP / browser-use 都不是必需依赖（真人操作即可）。接管回退模式下 MCP 原有的浏览器会被关闭（它的页面已由插件窗口接手），此后既可由真人在插件窗口里操作，也可用返回的 `cdpUrl` 让 MCP 重新连到这个窗口。
 - 插件自启窗口模式下，起始页的加载必然发生在录制开始之后，因此会连带录进一批页面初始化请求（登录态/字典/配置/埋点等），见「初始化请求噪音」一节；只有 attach 到「已加载完成」的页面才能避开。
 - 请求头中的敏感头默认脱敏；请求体/响应体不做内容级脱敏（可能含 token 等业务数据），`events.jsonl` 应按敏感数据处理，不要外发。
 - 跨域 iframe 的 UI 事件依赖 init script 注入，极少数强 CSP 页面可能注入失败（网络事件不受影响）。

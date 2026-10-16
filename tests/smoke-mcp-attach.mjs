@@ -5,6 +5,7 @@
  *   2. 原浏览器未被 kill、未新开第二个浏览器
  *   3. stop 后原浏览器仍存活
  */
+import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
@@ -50,11 +51,17 @@ const clicked = result.stats.clicks > 0
 console.log(`${clicked ? 'PASS' : 'FAIL'}  已加载页面上的点击被录到(clicks=${result.stats.clicks})`)
 if (!clicked) failed++
 
-// stop 后原浏览器仍存活
+// stop 后原浏览器仍存活。
+// 用 CDP 的 HTTP 端点判断(/json/version 探进程、/json/list 探页面 target), 而不是复用
+// Playwright 的 page 句柄: 同一个 Node 进程里 recorder 断开 CDP 后, 本进程内其他 client 的
+// 句柄会被 Playwright 一并置为 closed(客户端状态清理), 但浏览器与页面其实都活着 ——
+// 跨进程的真实协作方(Playwright MCP / 另一个脚本)不受此影响。
 let alive = false
 try {
-  await page.title()
-  alive = true
+  const port = Number(readFileSync(join(userDataDir, 'DevToolsActivePort'), 'utf8').split('\n')[0].trim())
+  const version = await fetch(`http://127.0.0.1:${port}/json/version`)
+  const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()
+  alive = version.ok && targets.some(t => t.type === 'page')
 } catch {
   alive = false
 }

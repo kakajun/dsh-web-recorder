@@ -97,6 +97,12 @@ try {
   process.exit(1)
 }
 
+// 外部 client 自己的 context / page 句柄: 用于最后断言「浏览器仍存活」。
+// 不能用 session.pages() —— 那是 recorder 侧句柄, 断开 CDP 后自然失效, 不代表浏览器被关。
+const externalContext =
+  externalBrowser.contexts()[0] ?? (await externalBrowser.newContext({ viewport: null }))
+const externalPage = externalContext.pages()[0] ?? (await externalContext.newPage())
+
 const opts = {
   channel,
   executablePath: '',
@@ -166,21 +172,25 @@ for (const [label, pass] of checks) {
 console.log(`\n[smoke-cdp] 事件总数 ${result.eventCount}, 产物目录: ${result.sessionDir}`)
 console.log(`[smoke-cdp] 报告: ${result.reportPath}`)
 
-// 关键断言: CDP attach 模式下 stop 不应关闭外部浏览器进程
-// RecorderSession 内部的 browser.close() 只会断开 CDP 连接, 浏览器进程应仍在运行
+// 关键断言: CDP attach 模式下 stop 只应断开录制连接, 不应关闭外部浏览器进程, 页面也要还在。
+// 用 CDP 的 HTTP 端点(/json/version 探进程、/json/list 探页面 target)判断, 而不是复用
+// Playwright 的对象句柄: 同一个 Node 进程里 recorder 断开 CDP 后, 本进程内其他 client 的
+// 句柄会被 Playwright 一并置为 closed(它自己的客户端状态清理), 但浏览器与页面其实都活着 ——
+// 跨进程的真实协作方(Playwright MCP / 另一个脚本)不受此影响。
 let browserStillAlive = false
+let aliveDetail = ''
 try {
-  const reconnected = await chromium.connectOverCDP(cdpUrl)
-  const pages = reconnected.contexts()[0]?.pages() ?? []
-  if (pages.length > 0) {
-    const title = await pages[0].title()
-    browserStillAlive = title === 'page2'
-  }
-  await reconnected.close().catch(() => undefined)
-} catch {
-  browserStillAlive = false
+  const version = await fetch(`${cdpUrl}/json/version`)
+  const targets = await (await fetch(`${cdpUrl}/json/list`)).json()
+  const pageStillThere = targets.some(t => t.type === 'page' && t.url.endsWith('/page2'))
+  browserStillAlive = version.ok && pageStillThere
+  aliveDetail = `/json/version=${version.status}, targets=${targets.map(t => `${t.type}:${t.url}`).join('|')}`
+} catch (cause) {
+  aliveDetail = `探测异常: ${cause instanceof Error ? cause.message : String(cause)}`
 }
-console.log(`${browserStillAlive ? 'PASS' : 'FAIL'}  stop 后外部浏览器进程未被关闭(仍可重新 CDP 连接)`)
+console.log(
+  `${browserStillAlive ? 'PASS' : 'FAIL'}  stop 后外部浏览器进程未被关闭(仍可重新 CDP 连接) [${aliveDetail}]`
+)
 if (!browserStillAlive) failed++
 
 await externalBrowser.close().catch(() => undefined)

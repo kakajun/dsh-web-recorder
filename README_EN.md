@@ -48,9 +48,9 @@ Reading the two side by side: a single "enter keyword and query" action shows up
 
 | Tool                   | Description                                                                              |
 | ---------------------- | ---------------------------------------------------------------------------------------- |
-| `recorder_start(url?, waitSeconds?)` | Starts recording: attaches to an existing browser window when possible (`cdpUrl`, or an auto-discovered Playwright MCP browser with a debugging port), otherwise launches a headed browser; optionally navigates to the starting URL; `waitSeconds` waits N seconds before anything is recorded (skips login / initialization noise). Events are written to `events.jsonl` in real time. The session is also registered as a background job and returned as `jobId` |
-| `recorder_stop()`      | Stops recording: generates the `report.md` summary; in attach mode it only disconnects CDP (only plugin-launched windows are closed); idempotent |
-| `recorder_status()`    | Reports status: whether recording is active, per-type event counts, output directory, `jobId`, and the result of the last wrap-up |
+| `recorder_start(url?, waitSeconds?)` | Starts recording: attaches to an existing browser window when possible (`cdpUrl`, or an auto-discovered **Chromium exposing a debugging port** — Playwright MCP browsers first), otherwise launches a headed browser; optionally navigates to the starting URL. A launched window **exposes its own CDP port** and the result carries that `cdpUrl`, so a driver can connect to it directly. `waitSeconds` waits N seconds before anything is recorded (skips login / initialization noise). Events are written to `events.jsonl` in real time. The session is also registered as a background job and returned as `jobId` |
+| `recorder_stop()`      | Stops recording: generates the `report.md` summary; in attach mode it **only drops the recording connection and never closes the external browser** (only plugin-launched windows are closed); idempotent |
+| `recorder_status()`    | Reports status: whether recording is active, per-type event counts, output directory, the CDP address of this recording window, `jobId`, and the result of the last wrap-up |
 
 If the user closes the browser window directly, the session is finalized automatically (`reason: browser-closed`) and the recorded data is kept.
 
@@ -93,10 +93,30 @@ The model (agent) orchestrates the session: arm the recorder first, direct the d
 5. **Wrap up**: `recorder_stop()` — generates the `report.md` summary (in attach mode it only disconnects the CDP session and leaves the external browser running; plugin-launched windows are closed; closing the window manually also finalizes the session). You may also do nothing and just close the window: the background job settles and notifies the model
 6. **Analyze and distill**: once the job completion notice arrives, the model reads `report.md` + `events.jsonl`, generalizes "flow steps × API calls × request/response contract", and further distills it into a skill or an API-integration guide
 
+### Zero-config attach: no more hand-editing MCP config
+
+Making a browser-automation tool and the recorder share one window used to require giving playwright MCP a `--remote-debugging-port` (i.e. writing a `playwright-mcp.config.json`). That step is now optional:
+
+**① Whichever browser exposes a debugging port gets attached** — auto-discovery has grown from "Playwright MCP only" to "any local Chromium started with `--remote-debugging-port`": a `chrome --remote-debugging-port=9222` you launched by hand, a chrome-devtools MCP browser, anything. When the port is `0` (Chrome picks one), the actual port is read from `DevToolsActivePort` under that user-data-dir. Playwright MCP browsers rank first.
+
+**② A plugin-launched window can be connected to as well** — launched windows now always get `--remote-debugging-port=0`, and `recorder_start` returns that CDP address as `cdpUrl`. Point the driver at it:
+
+| Driver | How to connect |
+| --- | --- |
+| playwright MCP | start MCP with `--cdp-endpoint=<cdpUrl>` |
+| browser-use | `BrowserSession(cdp_url=<cdpUrl>)` |
+| Your own playwright-core script | `chromium.connectOverCDP(cdpUrl)` |
+
+So "let MCP open the page first, then start recording" is no longer the only order — the **reverse** works too: the recorder opens the window first (`recorder_start`), hands `cdpUrl` to the driver, and everything it does there is recorded.
+
+**③ Log in once** — launched windows use a **persistent profile** (`~/.dsh-web-recorder/browser-profile` by default; override with Config `userDataDir`). Log into the target site once and every later recording starts already authenticated, which also drops the login-redirect batch of noise requests. If the persistent profile is unusable (e.g. held by a leftover process), the plugin falls back to a temporary profile automatically.
+
+> In attach mode `recorder_stop` **only drops the recording connection and never closes the external browser** (the MCP session and the user's window keep working). `pnpm smoke:cdp` / `pnpm smoke:mcp` assert both the process and the page survive.
+
 ### Collaboration prerequisite (important)
 
 - **playwright MCP is optional, not a prerequisite**: the plugin records fine without it (and without browser-use) — a human performing the flow in the popped-up window is enough, and that is the most common setup. MCP / browser-use only automate "opening pages + performing the steps".
-- **The one case where you cannot keep working in the browser playwright MCP already opened**: the MCP browser was started **without** `--remote-debugging-port`. The recorder then cannot attach and falls back to takeover: it notes the MCP browser's current URL, **kills the MCP browser process**, and re-opens the same page in a plugin-launched window. After that the MCP has lost its browser and can no longer drive it (if the MCP later opens a fresh window, that window is outside the recording scope too). To let the MCP and the recorder coexist — so the MCP can keep operating the very window being recorded — give the MCP browser a debugging port (or point `cdpUrl` at it explicitly).
+- **The one case where you cannot keep working in the browser playwright MCP already opened**: the MCP browser was started **without** `--remote-debugging-port`. The recorder then cannot attach and falls back to takeover: it notes the MCP browser's current URL, **kills the MCP browser process**, and re-opens the same page in a plugin-launched window. After that the MCP has lost its browser and can no longer drive it (if the MCP later opens a fresh window, that window is outside the recording scope too). To let the MCP and the recorder coexist there are two ways: give the **MCP browser** a debugging port (or point `cdpUrl` at it explicitly) so the recorder attaches to it; or go the **other way round** — after the takeover fallback, the plugin-launched window exposes its own CDP port (the returned `cdpUrl`), so the MCP can reconnect to that new window with `--cdp-endpoint=<cdpUrl>`.
 - Recording covers **the browser window the plugin attached to / started** (including its new tabs / iframes); operations by any driver (human or automation) are only captured when they happen **inside this window**.
 - **Sharing one browser window with playwright MCP**: start the MCP browser with a remote debugging port and the recorder attaches automatically. Pass a config file to `@playwright/mcp` (`--config=path/to/playwright-mcp.config.json`) containing:
   ```json
@@ -109,7 +129,7 @@ The model (agent) orchestrates the session: arm the recorder first, direct the d
   }
   ```
   With port `0`, Chrome picks a free port and writes it to the `DevToolsActivePort` file under its user-data-dir; `recorder_start` reads that file and attaches automatically (on Windows the MCP browser is located via the `ms-playwright-mcp` user-data-dir in the process command line). Without a debugging port the recorder cannot attach and falls back to takeover mode: it reads the MCP browser's current page URL, closes it, and re-opens the same page in a plugin-launched window.
-- You can also set `cdpUrl` explicitly in the plugin Config (e.g. `http://127.0.0.1:9222`) to choose the attach target; it takes precedence over auto-discovery. In attach mode `recorder_stop` only disconnects the CDP session and never closes the external browser process.
+- You can also set `cdpUrl` explicitly in the plugin Config (e.g. `http://127.0.0.1:9222`) to choose the attach target; it takes precedence over auto-discovery. In attach mode `recorder_stop` only disconnects the recording connection and never closes the external browser process (`pnpm smoke:cdp` / `pnpm smoke:mcp` assert that both the process and the page survive).
 
 ### Prerequisites and caveats
 
@@ -167,7 +187,8 @@ recorder_start({ url: "https://target/login", waitSeconds: 10 })
 | ------------------------ | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `channel`                | `msedge`                                                      | playwright-core browser channel (`msedge` / `chrome`); uses a browser already installed locally, never downloads Chromium |
 | `executablePath`         | `''`                                                          | Custom browser executable path; overrides `channel` when non-empty                                                     |
-| `cdpUrl`                 | `''`                                                          | CDP endpoint (e.g. `http://127.0.0.1:9222`); when set, attach to that existing browser first. When empty, a Playwright MCP browser with a debugging port is auto-discovered and attached; otherwise falls back to takeover / launching a new window |
+| `cdpUrl`                 | `''`                                                          | CDP endpoint (e.g. `http://127.0.0.1:9222`); when set, attach to that existing browser first. When empty, any local Chromium exposing a debugging port is auto-discovered and attached (Playwright MCP browsers first); otherwise falls back to takeover / launching a new window |
+| `userDataDir`            | `''`                                                          | Browser profile directory for the launched window; when empty, defaults to `~/.dsh-web-recorder/browser-profile`. A persistent profile keeps the login session across recordings (log in once) and makes the plugin window expose a CDP port drivers can connect to |
 | `outputDir`              | `''`                                                          | Root directory for artifacts; when empty, defaults to `reports/recorder` under the current working directory (the folder the user is working in, i.e. the harness session cwd) |
 | `captureResponseBodies`  | `true`                                                        | Whether to capture xhr / fetch response bodies                                                                          |
 | `maxBodyBytes`           | `16384`                                                       | Maximum number of bytes recorded for a single request / response body; anything beyond is truncated                     |
@@ -204,8 +225,8 @@ If you are submitting an entry to awesome-dsh-plugin:
 
 ## Known limitations
 
-- Records only the browser window the plugin attached to / started (including its new tabs / iframes); operations in any other browser instance are not captured. For automation-driven recording, the driver must share the same browser instance: when the MCP browser runs with `--remote-debugging-port` the recorder auto-attaches over CDP (see "Collaboration prerequisite"); an MCP browser without a debugging port can only be handled by the takeover fallback (the MCP browser is closed and a plugin window is opened instead, after which the MCP can no longer drive that window).
-- Neither playwright MCP nor browser-use is a required dependency (a human operator is enough), but in takeover mode the MCP browser is killed, so from then on only a human can continue in the plugin-launched window.
+- Records only the browser window the plugin attached to / started (including its new tabs / iframes); operations in any other browser instance are not captured. For automation-driven recording, the driver must share the same browser instance: when the browser runs with `--remote-debugging-port` the recorder auto-attaches over CDP (see "Collaboration prerequisite"), and a plugin-launched window exposes its own CDP port so a driver can connect to it (see "Zero-config attach").
+- Neither playwright MCP nor browser-use is a required dependency (a human operator is enough). In takeover mode the MCP's original browser is closed (its page has been taken over by the plugin window); afterwards either a human operates the plugin window, or the MCP reconnects to it using the returned `cdpUrl`.
 - In plugin-launched-window mode the start page inevitably loads after recording has begun, so a batch of initialization requests (auth / dictionaries / config / analytics …) is always recorded along with it — see "Initialization-request noise"; only attaching to an already-loaded page avoids it.
 - Sensitive request headers are redacted by default; request / response bodies get no content-level redaction (they may contain business data such as tokens), so treat `events.jsonl` as sensitive data and do not share it.
 - UI events in cross-origin iframes rely on init-script injection; pages with very strict CSP may block the injection (network events are unaffected).

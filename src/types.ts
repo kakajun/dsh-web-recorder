@@ -76,6 +76,11 @@ export interface RecorderOptions {
   cdpUrl: string
   /** 录制产物输出目录(每次录制在其下建时间戳子目录) */
   outputDir: string
+  /**
+   * 自启窗口使用的浏览器 profile 目录; 留空则用默认 ~/.dsh-web-recorder/browser-profile。
+   * 持久化 profile 让登录态跨次录制保留(目标站只需登录一次), 且插件窗口会因此暴露 CDP 端口。
+   */
+  userDataDir?: string
   /** 是否抓取 xhr/fetch 响应体(截断到 maxBodyBytes) */
   captureResponseBodies: boolean
   /** 请求体/响应体单次最大记录字节数 */
@@ -123,6 +128,10 @@ export interface StopResult {
   waitSeconds: number
   /** 等待期内被丢弃的事件数 */
   skippedEvents: number
+  /** 本次录制所用浏览器窗口的 CDP 地址(可用 connectOverCDP 连上继续操作) */
+  cdpUrl?: string
+  /** 自启窗口使用的持久化 profile 目录(仅自启模式) */
+  profileDir?: string
 }
 
 // 用 type 别名而非 interface: 对象字面量类型带隐式索引签名, 可赋给输出 schema 推断的 Record<string, JsonValue>

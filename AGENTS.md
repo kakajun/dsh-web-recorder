@@ -6,7 +6,9 @@
 
 `dsh-web-recorder` 是一个 DSH（DeepSeek Harness，`dsh web`）插件：网页操作录制器。
 
-面向「用户手动操作浏览器，插件在后台录制」的场景：优先 CDP attach 到正在运行的浏览器窗口（显式 `cdpUrl` 或自动发现带调试端口的 Playwright MCP 浏览器），否则启动一个有头浏览器窗口（默认本机 Edge），记录其中每次点击/输入/表单提交（UI 事件线）和每个网络请求/响应/失败（网络事件线），事件实时落盘 `events.jsonl`；停止录制后生成 Markdown 摘要报告 `report.md`。录制产物供大模型分析，归纳「业务流程 × 接口调用序列 × 数据契约」并沉淀为 skill。
+面向「用户手动操作浏览器，插件在后台录制」的场景：优先 CDP attach 到正在运行的浏览器窗口（显式 `cdpUrl`，或自动发现**本机任何带 `--remote-debugging-port` 的 Chromium**，Playwright MCP 浏览器优先），否则启动一个有头浏览器窗口（默认本机 Edge，**自带 CDP 端口 + 持久 profile**），记录其中每次点击/输入/表单提交（UI 事件线）和每个网络请求/响应/失败（网络事件线），事件实时落盘 `events.jsonl`；停止录制后生成 Markdown 摘要报告 `report.md`。录制产物供大模型分析，归纳「业务流程 × 接口调用序列 × 数据契约」并沉淀为 skill。
+
+「零配置接入」是本插件的核心目标之一：attach 不再依赖用户预先给 MCP 写配置（谁开了调试端口就接管谁），而插件自启的窗口也会把自身 CDP 地址回显给模型（`cdpUrl`），让驱动方反过来连上来接管——两个方向都能协同，无需手工准备浏览器环境。
 
 插件只负责「旁观并记录」，不直接操作页面——打开页面/按步骤操作由驱动方完成（真人、playwright MCP、browser-use 等）。设计初衷等背景详见 `README.md`（中文，另有 `README_EN.md` 英文版）。
 
@@ -14,9 +16,9 @@
 
 | 工具 | 说明 |
 | --- | --- |
-| `recorder_start(url?, waitSeconds?)` | 开始录制：attach 到已有浏览器窗口（cdpUrl / 自动发现 MCP CDP 端口）或启动有头浏览器，可导航到起始 URL；`waitSeconds` 让录制先等 N 秒再记录（跳过登录/初始化噪音），默认 0 立即记录；同时把本次录制登记为宿主后台任务并返回 `jobId` |
-| `recorder_stop()` | 停止录制：生成 `report.md`；attach 模式只断开 CDP 连接，插件自启窗口才关闭；幂等 |
-| `recorder_status()` | 查询状态：是否在录制、事件计数、产物目录、`jobId`、上次收尾结果 |
+| `recorder_start(url?, waitSeconds?)` | 开始录制：attach 到已有浏览器窗口（cdpUrl / 自动发现本机任何开了调试端口的 Chromium）或启动有头浏览器，可导航到起始 URL；自启窗口带 `--remote-debugging-port=0`，返回 `cdpUrl` + `profileDir` 供驱动方连接；`waitSeconds` 让录制先等 N 秒再记录（跳过登录/初始化噪音），默认 0 立即记录；同时把本次录制登记为宿主后台任务并返回 `jobId` |
+| `recorder_stop()` | 停止录制：生成 `report.md`；attach 模式**只断开录制连接、不关闭外部浏览器**（`disconnectBrowser()`），插件自启窗口才关闭；幂等 |
+| `recorder_status()` | 查询状态：是否在录制、事件计数、产物目录、本次录制窗口的 `cdpUrl`、`jobId`、上次收尾结果 |
 
 用户直接关掉浏览器窗口会自动收尾（`reason: browser-closed`），已录数据不丢；此时后台任务随之结算，模型收到完成通知被唤醒继续总结（见「后台任务」约定）。
 
@@ -37,7 +39,7 @@
 ```sh
 pnpm install       # 安装依赖(devDependencies 与 peerDependencies 对齐)
 pnpm typecheck     # tsc --noEmit
-pnpm test          # vitest run, 单元测试(report 生成纯函数)
+pnpm test          # vitest run, 单元测试(report / stats 纯函数)
 pnpm test:watch    # vitest watch 模式
 pnpm build         # tsdown 产物到 lib/(插件加载与 smoke 依赖该产物)
 pnpm smoke         # 真实 Edge 端到端冒烟(需本机已装浏览器, 产物在 reports/)
@@ -56,13 +58,18 @@ src/
               Config(schemastery schema) 与 apply(ctx, config) —— 注册 3 个工具,
               管理单会话生命周期(session/lastResult), 插件卸载时经 ctx.effect 兜底收尾。
               Config 默认值由 RECORDER_DEFAULTS 单一来源提供(schema 与 apply 兜底共用)。
-  session.ts  RecorderSession 录制会话核心: 启动浏览器(cdpUrl / 自动发现 MCP CDP 端口 /
-              等待期 waitSeconds(录制开始后先等 N 秒再记录, 等待期内事件整组丢弃: request 不登记
-              requestId 故其响应/失败一并忽略; 计时自 startedAt 起算, 覆盖浏览器启动与起始页导航) /
-              channel / executablePath, attach 优先、失败回退接管或新开)、注入 INIT_SCRIPT(捕获阶段
-              监听 click/change/submit, 经 exposeBinding 回传 UI 事件; attach 模式对已加载页面
-              直接 evaluate 补装)、监听 request/response/requestfailed/console 事件, 事件内存留存
-              + 逐行写 events.jsonl; finished() 暴露「收尾完成」信号供宿主后台任务结算;
+              recorder_start / recorder_status 回显 cdpUrl 与 profileDir(零配置接入的可见性)。
+  session.ts  RecorderSession 录制会话核心: 启动浏览器(cdpUrl / 自动发现本机任意开了调试端口的
+              Chromium / 等待期 waitSeconds(录制开始后先等 N 秒再记录, 等待期内事件整组丢弃: request
+              不登记 requestId 故其响应/失败一并忽略; 计时自 startedAt 起算, 覆盖浏览器启动与起始页
+              导航) / channel / executablePath / userDataDir, attach 优先、失败回退接管或自启窗口)、
+              launchBrowser() 用 launchPersistentContext + `--remote-debugging-port=0` 起窗口
+              (端口从 profile 下 DevToolsActivePort 读出 → cdpUrl(); 持久 profile 保留登录态,
+              失败自动回退临时 profile)、disconnectBrowser() 只断 CDP 连接不关外部浏览器、
+              注入 INIT_SCRIPT(捕获阶段监听 click/change/submit, 经 exposeBinding 回传 UI 事件;
+              attach 模式对已加载页面直接 evaluate 补装)、监听 request/response/requestfailed/console
+              事件(requestStartedAt 结算响应耗时 durationMs), 事件内存留存 + 逐行写 events.jsonl;
+              status()/snapshot() 供实时查询, finished() 暴露「收尾完成」信号供宿主后台任务结算;
               stop() 幂等收尾, 浏览器被关闭时自动 finalize。
               finalize 经 finalizePromise 去重(stop / 关窗口 / 插件卸载可能并发触发), 只跑一次。
   report.ts   generateMarkdown(events, meta): 从事件序列生成 Markdown 摘要
@@ -73,13 +80,16 @@ src/
   stats.ts    SessionStats 计数的单一口径: createSessionStats / accumulateEvent(会话 push 时增量累加) /
               countEvents(报告一次性统计), 两处共用, 避免口径漂移。
   init-script.ts  注入页面的 UI 事件采集脚本 INIT_SCRIPT(click/change/submit 捕获 + selector/label 提取)。
-  browser-discovery.ts  Playwright MCP 浏览器的发现与接管(仅 Windows 实现: PowerShell CIM 查
-              user-data-dir、读 DevToolsActivePort 得 CDP 端口、读 Chrome Sessions 的 Tabs 文件取最近
-              URL、kill 后轮询等进程退出); createMcpBrowserProbe() 返回探针, 同一次 start 内缓存
-              user-data-dir(避免重复 spawn), 非 Windows 一律返回 undefined 直接回退新开窗口。
+  browser-discovery.ts  本机 Chromium 的 CDP 发现与接管(仅 Windows 实现: 一条 PowerShell 语句
+              扫出所有带 --remote-debugging-port 的顶层进程 → 端口为 0 时读其 user-data-dir 下
+              DevToolsActivePort 取实际端口 → MCP 特征优先排序; 另外读 Chrome Sessions 的 Tabs 文件
+              取最近 URL、kill MCP 进程后轮询等退出); createBrowserProbe() 返回探针, 同一次 start 内
+              缓存扫描结果(避免重复 spawn), 非 Windows 返回空直接回退新开窗口。
+              所有 PowerShell 调用统一走 runPowerShell(EncodedCommand + $ProgressPreference 抑制噪音)。
 lib/          tsdown 构建产物(已 gitignore), 入口 lib/index.js
 tests/
   report.test.ts  vitest 单元测试, 直接跑 TS 源码(无需 build), 只测 generateMarkdown
+  stats.test.ts   vitest 单元测试, 覆盖计数口径
   smoke.mjs       端到端冒烟(手工运行): 本地起 HTTP 服务, 真实 Edge 录制并断言产物
   smoke-cdp.mjs   CDP attach 模式冒烟: 先启带调试端口浏览器, 再 attach 录制
   smoke-mcp-attach.mjs  MCP 自动发现冒烟: 模拟带 --remote-debugging-port=0 的 MCP Chrome
@@ -106,6 +116,9 @@ assets/           README 截图与封面
 - 后台任务的结算只走 `RecorderSession.finished()`（收尾 → job 结算 → 宿主通知模型），`job.hooks.cancel` 落到 `session.stop()`；`recorder_stop` 拿到结果后再 `read` 一次把任务标为已报告，避免模型重复收到完成通知。
 - 事件计数只走 `src/stats.ts`：会话侧 `push` 时增量累加，报告侧 `countEvents` 一次性统计，两处不得各写一份 `switch`。
 - 等待期（前置剔除）只有 `waitSeconds` 一个入参（工具调用时传，默认 0），不进 Config；丢弃逻辑集中在 `RecorderSession.waiting()` 与各事件入口的早退分支，等待期内被丢的事件只累计 `skipped` 供回显。
+- **attach 模式收尾只能断开、绝不关闭外部浏览器**：`stop()` 走 `disconnectBrowser()`——实测（playwright-core 1.63 + Edge）`browser.close()` 在 `connectOverCDP` 场景下会把外部浏览器进程真的关掉（调试端口随即 404），而「接管用户的窗口、录完就关掉它」会连带搞挂 MCP 会话；因此优先关底层连接（只断 WebSocket），拿不到内部句柄才回退公开 API。改动这段务必跑 `pnpm smoke:cdp` + `pnpm smoke:mcp`。
+- **自启窗口固定带 `--remote-debugging-port=0` 且用持久 profile**（`launchPersistentContext` + `userDataDir`，默认 `~/.dsh-web-recorder/browser-profile`）：前者让窗口暴露 CDP 端口、供驱动方 connectOverCDP 接管（零配置接入的另一半），后者让登录态跨次录制保留；profile 不可用时退回临时 profile，不让「记住登录态」挡掉「能录」。
+- **工具 `output.schema` 与 TS 侧类型必须对齐**：`defineTool` 能从 schema 精确推断 `render` / `execute` 的类型，字段对不上会直接编译失败（例如 `additionalProperties: true` 的 `counts` 要写成 `Record<string, JsonValue>`、字面量联合要配 `enum`、可选性要与 `required` 一致）。改 schema 后跑 `pnpm typecheck` 验证。
 - 启动中途失败要释放已建的浏览器与事件流；attach 失败同样要断开已建立的连接（`start` / `tryAttach` 的 catch 里处理）。
 - 保留 `console.log` 等调试输出，仅在明确要求时删除。
 - Node 版本由 fnm 管理（`D:\fnm\node-versions`，`fnm list` 查看）。
@@ -113,10 +126,11 @@ assets/           README 截图与封面
 
 ## 测试策略
 
-- **单元测试**（`pnpm test`）：vitest，直接运行 TS 源码无需构建。覆盖 `report.ts` 的 `generateMarkdown` 纯函数（`tests/report.test.ts`）与 `stats.ts` 的计数口径（`tests/stats.test.ts`）。
-- **端到端冒烟**（`pnpm smoke` / `pnpm smoke:cdp` / `pnpm smoke:mcp` / `pnpm smoke:wait`）：非测试框架的手工脚本，需要本机安装 Edge（或 Chrome）。前三者分别覆盖新开窗口录制、显式 cdpUrl attach、MCP 浏览器 CDP 端口自动发现 attach，`smoke:wait` 覆盖等待期（等待期内不记录、等待期后正常记录）；`smoke:cdp`/`smoke:mcp` 还断言 `stop` 后外部浏览器进程不被关闭。断言 `events.jsonl` 与 `report.md` 内容（点击/输入/请求/响应/脱敏）。
+- **单元测试**（`pnpm test`）：vitest，直接运行 TS 源码无需构建。覆盖 `report.ts` 的 `generateMarkdown`（`tests/report.test.ts`）与 `stats.ts` 的计数口径（`tests/stats.test.ts`）。
+- **端到端冒烟**（`pnpm smoke` / `pnpm smoke:cdp` / `pnpm smoke:mcp` / `pnpm smoke:wait`）：非测试框架的手工脚本，需要本机安装 Edge（或 Chrome）。前三者分别覆盖新开窗口录制、显式 cdpUrl attach、MCP 浏览器 CDP 端口自动发现 attach，`smoke:wait` 覆盖等待期（等待期内不记录、等待期后正常记录）。
+- **「外部浏览器没被关掉」的断言必须用 CDP 的 HTTP 端点**（`/json/version` 探进程、`/json/list` 探页面 target），**不要**用 `connectOverCDP` 重连或复用 Playwright 的对象句柄：同一个 Node 进程里 recorder 断开 CDP 后，Playwright 会把本进程内其他 client 的句柄一并置为 closed（它自己的客户端状态清理），浏览器与页面其实都活着——跨进程的真实协作方（Playwright MCP / 另一个脚本）不受影响。用句柄断言会得到假失败。
 - **CI**（`.github/workflows/ci.yml`）：push / PR 即触发 GitHub Actions。`test` job（ubuntu-latest + Node 22 + pnpm 10）跑 `install --frozen-lockfile` → `typecheck` → `test` → `build`；`smoke` job 安装 Chrome 与 xvfb（有头模式需要虚拟 X server，`SMOKE_CHANNEL=chrome`）跑 `smoke` / `smoke:wait` / `smoke:cdp`，失败时上传 `reports/` 产物。`smoke:mcp` 依赖 Windows 专用发现逻辑，不放 Linux CI。
-- 修改 `session.ts` 事件采集逻辑后，应跑 `pnpm build && pnpm smoke`（CDP 相关改动另跑 `pnpm smoke:cdp`）验证；修改 `report.ts` 至少跑 `pnpm test` + `pnpm typecheck`。
+- 修改 `session.ts` 事件采集逻辑后，应跑 `pnpm build && pnpm smoke`（CDP / 断开 / 自启窗口相关改动另跑 `pnpm smoke:cdp` + `pnpm smoke:mcp`）验证；修改 `report.ts` 至少跑 `pnpm test` + `pnpm typecheck`；改 `src/index.ts` 的 tool schema 必跑 `pnpm typecheck`。
 
 ## 安全注意事项
 
@@ -124,7 +138,8 @@ assets/           README 截图与封面
 - 密码输入框的值不落盘，只记录输入动作（`redacted: true`）。
 - 请求体/响应体截断到 `maxBodyBytes`（默认 16384）。
 - **请求体/响应体不做内容级脱敏**（可能含 token 等业务数据）——`events.jsonl` 含完整请求头/体，按敏感数据处理，勿外发、勿提交到仓库（`reports/` 已 gitignore，注意保持）。
-- `src/browser-discovery.ts` 中有针对 Playwright MCP 浏览器的检测/接管逻辑（Windows 专用：经 PowerShell CIM 查进程、读 `DevToolsActivePort` 自动发现 CDP 端口并 attach、读 Chrome Sessions 的 Tabs 文件提取 URL、`Stop-Process` 关闭旧进程）——涉及杀进程，改动需格外谨慎；非 Windows 平台该模块整体返回 `undefined`（回退新开窗口），不要为非 Windows 引入会误杀进程的实现。
+- `src/browser-discovery.ts` 中有针对本机 Chromium 的检测/接管逻辑（Windows 专用：经 PowerShell CIM 查进程、读 `DevToolsActivePort` 自动发现 CDP 端口并 attach、读 Chrome Sessions 的 Tabs 文件提取 URL、`Stop-Process` 关闭旧的 MCP 进程）——涉及杀进程，改动需格外谨慎。**`killMcpBrowser()` 只允许匹配带 `ms-playwright-mcp` 特征的进程，绝不能扩大到「所有带调试端口的浏览器」**（否则会杀掉用户自己的浏览器）。非 Windows 平台该模块整体返回空（回退新开窗口），不要为非 Windows 引入会误杀进程的实现。
+- 浏览器 profile 目录（默认 `~/.dsh-web-recorder/browser-profile`）保存着目标站的登录态 / cookie，属于敏感数据：不要提交到仓库、不要外发；`reports/` 与它都在仓库之外或已 gitignore。
 
 ## 环境
 
