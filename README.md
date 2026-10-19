@@ -11,7 +11,7 @@
 
 **语言：简体中文 · [English](README_EN.md)**
 
-> **宿主版本要求**：本插件适配 `@deepseek-ai/dsh` **`^0.2.0-rc.2`**（依赖其 `@deepseek-ai/dsh-tools@0.2.0-rc.2`），即 profile 的 `package.json` 需满足 `"@deepseek-ai/dsh": "^0.2.0-rc.2"`。
+> **宿主版本要求**：本插件适配 `@deepseek-ai/dsh` **`^0.2.1-rc.2`**（依赖其 `@deepseek-ai/dsh-tools@0.2.1-rc.2`），即 profile 的 `package.json` 需满足 `"@deepseek-ai/dsh": "^0.2.1-rc.2"`。
 
 ![dsh-web-recorder 封面](assets/podcast-cover.png)
 
@@ -48,7 +48,7 @@
 
 ## 🚀 安装
 
-**前置**：已装好 DSH（`dsh web` 能正常运行，`@deepseek-ai/dsh` 需为 `^0.2.0-rc.2`），Node.js ≥ 18、pnpm ≥ 8。
+**前置**：已装好 DSH（`dsh web` 能正常运行，`@deepseek-ai/dsh` 需为 `^0.2.1-rc.2`），Node.js ≥ 18、pnpm ≥ 8。
 
 ```sh
 dsh plugin --profile web add dsh-web-recorder@latest
